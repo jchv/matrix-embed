@@ -1,0 +1,9 @@
+target/
+state/
+password*
+*.db
+.env
+.direnv/
+flake.nix
+flake.lock
+result
