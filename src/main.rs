@@ -4,12 +4,16 @@ use matrix_sdk::{
     Client, SessionMeta,
     authentication::{SessionTokens, matrix::MatrixSession},
     config::SyncSettings,
-    room::Room,
-    ruma::events::room::{
-        member::{MembershipState, StrippedRoomMemberEvent},
-        message::{
-            MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent,
-            TextMessageEventContent,
+    room::{Room, reply::Reply},
+    ruma::events::{
+        relation::Replacement,
+        room::{
+            member::{MembershipState, StrippedRoomMemberEvent},
+            message::{
+                AddMentions, ForwardThread, MessageType, OriginalSyncRoomMessageEvent, Relation,
+                RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+                TextMessageEventContent,
+            },
         },
     },
     store::RoomLoadSettings,
@@ -141,13 +145,17 @@ async fn main() -> Result<()> {
         .wait_for_e2ee_initialization_tasks()
         .await;
 
-    let config = Arc::new(config);
+    if config.reset_identity {
+        client.encryption().recovery().reset_identity().await?;
+    }
+
     let mut http_builder = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)");
     if let Some(proxy) = config.proxy.clone() {
         http_builder = http_builder.proxy(Proxy::all(proxy)?);
     }
     let http_client = http_builder.build()?;
+    let config = Arc::new(config);
 
     // Event Handler
     client.add_event_handler({
@@ -228,7 +236,7 @@ async fn handle_message(
     config: Arc<Config>,
     http_client: reqwest::Client,
 ) -> Result<()> {
-    let msgtype = match event.content.msgtype {
+    let msgtype = match event.content.msgtype.clone() {
         MessageType::Text(t) => t,
         _ => return Ok(()),
     };
@@ -241,7 +249,7 @@ async fn handle_message(
             // Apply URL rewrites
             let url = config.rewrite_url(&url);
             debug!("Found URL: {}", url);
-            if let Err(e) = process_url(&http_client, &room, &config, &url).await {
+            if let Err(e) = process_url(&http_client, &room, &config, &url, event.clone()).await {
                 warn!("Failed to process URL {}: {:?}", url, e);
             }
             // Only process the first URL found (for now?)
@@ -257,6 +265,7 @@ async fn process_url(
     room: &Room,
     config: &Config,
     url: &Url,
+    reply: OriginalSyncRoomMessageEvent,
 ) -> Result<()> {
     match Metadata::fetch_from_url(http_client, url).await {
         Ok(meta) => {
@@ -265,7 +274,7 @@ async fn process_url(
                 return Ok(());
             }
             let params = process_metadata(meta);
-            post_message(http_client, room, config, params).await?;
+            post_message(http_client, room, config, params, reply).await?;
         }
         Err(e) => {
             warn!("Failed to fetch metadata for {}: {:?}", url, e);
@@ -279,26 +288,46 @@ async fn post_message(
     room: &Room,
     config: &Config,
     params: MessageParams,
+    reply: OriginalSyncRoomMessageEvent,
 ) -> Result<()> {
     let caption = TextMessageEventContent::html(params.body.clone(), params.html_body.clone());
 
     if let Some(media_url) = params.media_url {
         info!("Downloading media from {}", media_url);
 
-        if let Err(e) =
-            download_and_upload(http_client, room, &media_url, config, Some(caption)).await
+        if let Err(e) = download_and_upload(
+            http_client,
+            room,
+            &media_url,
+            config,
+            Some(caption),
+            Reply {
+                event_id: reply.event_id.clone(),
+                enforce_thread: matrix_sdk::room::reply::EnforceThread::MaybeThreaded,
+            },
+        )
+        .await
         {
             error!("Failed to upload media: {:?}", e);
             // Fallback: Reply with text embed if failed
-            let content = RoomMessageEventContent::text_html(params.body, params.html_body);
-            room.send(content).await?;
+            room.send(
+                RoomMessageEventContent::text_html(params.body, params.html_body).make_reply_to(
+                    &reply,
+                    ForwardThread::Yes,
+                    AddMentions::No,
+                ),
+            )
+            .await?;
         }
     } else {
         // Just text embed if no media
-        room.send(RoomMessageEventContent::text_html(
-            params.body,
-            params.html_body,
-        ))
+        room.send(
+            RoomMessageEventContent::text_html(params.body, params.html_body).make_reply_to(
+                &reply,
+                ForwardThread::Yes,
+                AddMentions::No,
+            ),
+        )
         .await?;
     }
     Ok(())
@@ -310,6 +339,7 @@ pub async fn download_and_upload(
     url: &Url,
     config: &Config,
     text: Option<TextMessageEventContent>,
+    reply: Reply,
 ) -> Result<()> {
     let response = client
         .get(url.clone())
@@ -325,7 +355,7 @@ pub async fn download_and_upload(
         &attachment.filename,
         &attachment.mime_type,
         attachment.data,
-        attachment.attachment_config,
+        attachment.attachment_config.reply(Some(reply)),
     )
     .await?;
 

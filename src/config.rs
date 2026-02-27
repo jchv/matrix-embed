@@ -8,7 +8,7 @@ use url::Url;
 
 const DEFAULT_HOMESERVER_URL: &str = "https://matrix.org";
 const DEFAULT_STATE_STORE_PATH: &str = "state";
-const DEFAULT_MAX_FILE_SIZE: u64 = 26214400; // 25 MB
+const DEFAULT_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_DOWNLOAD_TIMEOUT_SECONDS: u64 = 30;
 
 fn default_url_rewrites() -> Vec<(regex::Regex, String)> {
@@ -71,6 +71,10 @@ pub struct Args {
     /// Proxy to use when making external requests
     #[arg(long)]
     pub proxy: Option<Url>,
+
+    /// Reset identity
+    #[arg(long)]
+    pub reset_identity: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -93,6 +97,7 @@ pub struct Config {
     pub url_rewrites: Vec<(regex::Regex, String)>,
     pub avatar_data: Option<Vec<u8>>,
     pub proxy: Option<Url>,
+    pub reset_identity: bool,
 }
 
 impl Config {
@@ -179,6 +184,7 @@ impl Config {
             url_rewrites,
             avatar_data,
             proxy: args.proxy,
+            reset_identity: args.reset_identity,
         })
     }
 
@@ -211,6 +217,7 @@ impl Default for Config {
             url_rewrites: default_url_rewrites(),
             avatar_data: None,
             proxy: None,
+            reset_identity: false,
         }
     }
 }

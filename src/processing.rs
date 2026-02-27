@@ -24,10 +24,10 @@ pub struct AttachmentData {
 }
 
 pub fn process_metadata(meta: Metadata) -> MessageParams {
-    let media_url = if meta.card.as_deref() == Some("summary") {
-        None
-    } else {
-        meta.video_url.or(meta.audio_url).or(meta.image_url)
+    let media_url = match meta.card.as_deref() {
+        Some("summary") => None,
+        Some("tweet") => None,
+        _ => meta.video_url.or(meta.audio_url).or(meta.image_url),
     };
 
     let body = format!(
