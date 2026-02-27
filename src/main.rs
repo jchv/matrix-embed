@@ -19,8 +19,10 @@ use mime_guess::Mime;
 use reqwest::Proxy;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
+use std::future::Future;
 use std::io::BufReader;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
@@ -269,7 +271,7 @@ async fn process_url(
             if meta.is_empty() {
                 return Ok(());
             }
-            let params = process_metadata(meta);
+            let params = process_metadata(meta, config);
             post_message(http_client, room, config, params, reply).await?;
         }
         Err(e) => {
@@ -279,6 +281,26 @@ async fn process_url(
     Ok(())
 }
 
+async fn with_typing<F, T>(room: &Room, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let typing_room = room.clone();
+    let typing_task = tokio::spawn(async move {
+        loop {
+            let _ = typing_room.typing_notice(true).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+
+    let result = fut.await;
+
+    typing_task.abort();
+    let _ = room.typing_notice(false).await;
+
+    result
+}
+
 async fn post_message(
     http_client: &reqwest::Client,
     room: &Room,
@@ -286,36 +308,48 @@ async fn post_message(
     params: MessageParams,
     reply: OriginalSyncRoomMessageEvent,
 ) -> Result<()> {
-    let caption = TextMessageEventContent::html(params.body.clone(), params.html_body.clone());
+    let has_text = !params.body.is_empty() || !params.html_body.is_empty();
+
+    let caption = if has_text {
+        Some(TextMessageEventContent::html(
+            params.body.clone(),
+            params.html_body.clone(),
+        ))
+    } else {
+        None
+    };
 
     if let Some(media_url) = params.media_url {
         info!("Downloading media from {}", media_url);
 
-        if let Err(e) = download_and_upload(
-            http_client,
+        let result = with_typing(
             room,
-            &media_url,
-            config,
-            Some(caption),
-            Reply {
-                event_id: reply.event_id.clone(),
-                enforce_thread: matrix_sdk::room::reply::EnforceThread::MaybeThreaded,
-            },
+            download_and_upload(
+                http_client,
+                room,
+                &media_url,
+                config,
+                caption,
+                Reply {
+                    event_id: reply.event_id.clone(),
+                    enforce_thread: matrix_sdk::room::reply::EnforceThread::MaybeThreaded,
+                },
+            ),
         )
-        .await
-        {
+        .await;
+
+        if let Err(e) = result {
             error!("Failed to upload media: {:?}", e);
             // Fallback: Reply with text embed if failed
-            room.send(
-                RoomMessageEventContent::text_html(params.body, params.html_body).make_reply_to(
-                    &reply,
-                    ForwardThread::Yes,
-                    AddMentions::No,
-                ),
-            )
-            .await?;
+            if has_text {
+                room.send(
+                    RoomMessageEventContent::text_html(params.body, params.html_body)
+                        .make_reply_to(&reply, ForwardThread::Yes, AddMentions::No),
+                )
+                .await?;
+            }
         }
-    } else {
+    } else if has_text {
         // Just text embed if no media
         room.send(
             RoomMessageEventContent::text_html(params.body, params.html_body).make_reply_to(

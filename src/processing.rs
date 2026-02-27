@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::media::{generate_blurhash, generate_thumbnail, probe_media};
+use crate::media::{generate_blurhash, generate_thumbnail, probe_media, remux_to_mp4};
 use crate::metadata::Metadata;
 use anyhow::{Result, bail};
 use matrix_sdk::attachment::{AttachmentConfig, BaseAudioInfo, BaseVideoInfo};
@@ -8,8 +8,9 @@ use matrix_sdk::ruma::events::room::message::TextMessageEventContent;
 use mime_guess::Mime;
 use reqwest::Url;
 use std::io::Write;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
+#[derive(Debug)]
 pub struct MessageParams {
     pub body: String,
     pub html_body: String,
@@ -23,49 +24,55 @@ pub struct AttachmentData {
     pub attachment_config: AttachmentConfig,
 }
 
-pub fn process_metadata(meta: Metadata) -> MessageParams {
+pub fn process_metadata(meta: Metadata, config: &Config) -> MessageParams {
     let media_url = match meta.card.as_deref() {
         Some("summary") => None,
         Some("tweet") => None,
         _ => meta.video_url.or(meta.audio_url).or(meta.image_url),
     };
 
-    let body = format!(
-        "{}{}",
-        meta.title
-            .clone()
-            .map(|s| s.to_string())
-            .unwrap_or_default(),
-        meta.description
-            .clone()
-            .map(|s| format!(": {}", s))
-            .unwrap_or_default()
-    );
-
-    let html_title = meta.title.clone().map(|s| {
-        let escaped = html_escape::encode_text(&s);
-        escaped.replace('\n', "<br/>")
+    // Filter out titles matching any ignored pattern
+    let title = meta.title.filter(|t| {
+        !config
+            .ignored_title_patterns
+            .iter()
+            .any(|re| re.is_match(t))
     });
+    let description = meta.description;
+    let has_title = title.is_some();
+    let has_desc = description.is_some();
 
-    let html_desc = meta.description.clone().map(|s| {
-        let escaped = html_escape::encode_text(&s);
-        escaped.replace('\n', "<br/>")
-    });
+    let body = match (&title, &description) {
+        (Some(t), Some(d)) => format!("{}: {}", t, d),
+        (Some(t), None) => t.clone(),
+        (None, Some(d)) => d.clone(),
+        (None, None) => String::new(),
+    };
 
-    let html_body = format!(
-        "{}<blockquote>{}{}</blockquote>",
-        if media_url.is_some() { "<br/>" } else { "" },
-        html_title
-            .map(|s| format!(
-                "<strong>{}{}</strong>",
-                s,
-                if meta.description.is_some() { ":" } else { "" }
-            ))
-            .unwrap_or_default(),
-        html_desc
-            .map(|s| format!("<p>{}</p>", s))
-            .unwrap_or_default(),
-    );
+    let html_body = if has_title || has_desc {
+        let html_title = title.map(|s| {
+            let escaped = html_escape::encode_text(&s);
+            escaped.replace('\n', "<br/>")
+        });
+
+        let html_desc = description.map(|s| {
+            let escaped = html_escape::encode_text(&s);
+            escaped.replace('\n', "<br/>")
+        });
+
+        format!(
+            "{}<blockquote>{}{}</blockquote>",
+            if media_url.is_some() { "<br/>" } else { "" },
+            html_title
+                .map(|s| format!("<strong>{}{}</strong>", s, if has_desc { ":" } else { "" }))
+                .unwrap_or_default(),
+            html_desc
+                .map(|s| format!("<p>{}</p>", s))
+                .unwrap_or_default(),
+        )
+    } else {
+        String::new()
+    };
 
     MessageParams {
         body,
@@ -113,7 +120,7 @@ pub async fn process_response(
     }
 
     let path = tmp_file.path();
-    let data = tokio::fs::read(path).await?;
+    let mut data = tokio::fs::read(path).await?;
 
     // Sniff MIME type from content
     if let Some(kind) = infer::get(&data) {
@@ -124,6 +131,20 @@ pub async fn process_response(
     }
 
     debug!("Final MIME type: {}", mime_type);
+
+    // Remux Matroska video to MP4 for better client compatibility
+    if mime_type == "video/x-matroska" {
+        match remux_to_mp4(&data).await {
+            Ok(mp4_data) => {
+                info!("Successfully remuxed MKV to MP4");
+                data = mp4_data;
+                mime_type = "video/mp4".parse().unwrap();
+            }
+            Err(e) => {
+                warn!("Failed to remux MKV to MP4, using original: {:?}", e);
+            }
+        }
+    }
 
     let mime_extensions = mime_guess::get_mime_extensions(&mime_type);
     let preferred_extension = mime_extensions
@@ -296,7 +317,7 @@ mod tests {
             audio_url: None,
         };
 
-        let params = process_metadata(meta);
+        let params = process_metadata(meta, &Config::default());
 
         assert_eq!(params.body, "Test Title: Test Description");
         assert!(params.html_body.contains("<strong>Test Title:</strong>"));

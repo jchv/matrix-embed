@@ -11,6 +11,10 @@ const DEFAULT_STATE_STORE_PATH: &str = "state";
 const DEFAULT_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_DOWNLOAD_TIMEOUT_SECONDS: u64 = 30;
 
+fn default_ignored_title_patterns() -> Vec<Regex> {
+    vec![Regex::new(r"^(Image|Video|Audio) File$").unwrap()]
+}
+
 fn default_url_rewrites() -> Vec<(regex::Regex, String)> {
     vec![
         (
@@ -75,6 +79,10 @@ pub struct Args {
     /// Reset identity
     #[arg(long)]
     pub reset_identity: bool,
+
+    /// Regular expressions for og:title values that should be ignored (can be specified multiple times)
+    #[arg(long)]
+    pub ignored_title_pattern: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -95,6 +103,7 @@ pub struct Config {
     pub download_timeout: Duration,
     pub trusted_users: Vec<String>,
     pub url_rewrites: Vec<(regex::Regex, String)>,
+    pub ignored_title_patterns: Vec<Regex>,
     pub avatar_data: Option<Vec<u8>>,
     pub proxy: Option<Url>,
     pub reset_identity: bool,
@@ -161,6 +170,18 @@ impl Config {
             default_url_rewrites()
         };
 
+        let ignored_title_patterns = if args.ignored_title_pattern.is_empty() {
+            default_ignored_title_patterns()
+        } else {
+            args.ignored_title_pattern
+                .iter()
+                .map(|p| {
+                    Regex::new(p)
+                        .with_context(|| format!("Invalid ignored title pattern regex: {}", p))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
         let avatar_data = if let Some(path) = args.avatar_file {
             Some(
                 tokio::fs::read(&path)
@@ -182,6 +203,7 @@ impl Config {
             download_timeout: Duration::from_secs(args.download_timeout_seconds),
             trusted_users: args.trusted_users,
             url_rewrites,
+            ignored_title_patterns,
             avatar_data,
             proxy: args.proxy,
             reset_identity: args.reset_identity,
@@ -215,6 +237,7 @@ impl Default for Config {
             download_timeout: Duration::from_secs(DEFAULT_DOWNLOAD_TIMEOUT_SECONDS),
             trusted_users: vec![],
             url_rewrites: default_url_rewrites(),
+            ignored_title_patterns: default_ignored_title_patterns(),
             avatar_data: None,
             proxy: None,
             reset_identity: false,

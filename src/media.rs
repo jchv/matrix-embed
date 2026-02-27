@@ -1,16 +1,21 @@
 use anyhow::{Context, Result, bail};
 use image::GenericImageView;
+use std::io::Write;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
+use tracing::{info, warn};
 
 const FFPROBE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const FFPROBE_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 const FFMPEG_THUMBNAIL_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const FFMPEG_THUMBNAIL_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+const FFMPEG_REMUX_TIMEOUT: Duration = Duration::from_secs(20);
+const FFMPEG_REENCODE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct MediaInfo {
@@ -118,6 +123,128 @@ pub async fn generate_thumbnail(data: &[u8], target_width: u32) -> Result<Vec<u8
     }
 
     Ok(output.stdout)
+}
+
+/// Remuxes a Matroska video to MP4 format using ffmpeg.
+///
+/// First attempts a fast stream-copy remux (`-c copy`). If that fails (e.g.
+/// codecs incompatible with the MP4 container), falls back to reencoding with
+/// libx264/aac. Uses temporary files so ffmpeg can seek freely (needed for the
+/// MP4 moov atom and `-movflags +faststart`).
+pub async fn remux_to_mp4(data: &[u8]) -> Result<Vec<u8>> {
+    let mut input_file =
+        tempfile::NamedTempFile::new().context("Failed to create temp input file for remux")?;
+    input_file
+        .write_all(data)
+        .context("Failed to write input data to temp file for remux")?;
+    input_file
+        .flush()
+        .context("Failed to flush temp input file for remux")?;
+    let input_path = input_file.path().to_path_buf();
+
+    let output_file =
+        tempfile::NamedTempFile::new().context("Failed to create temp output file for remux")?;
+    let output_path = output_file.path().to_path_buf();
+
+    // Attempt 1: fast remux with stream copy (no reencoding)
+    let input_str = input_path.to_str().context("Non-UTF8 temp input path")?;
+    let output_str = output_path.to_str().context("Non-UTF8 temp output path")?;
+
+    info!("Attempting MKV -> MP4 remux (stream copy)");
+    let remux_result = timeout(
+        FFMPEG_REMUX_TIMEOUT,
+        Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                input_str,
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "mp4",
+                "-y",
+                output_str,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .context("Remux timed out")?
+    .context("Failed to run ffmpeg for remux")?;
+
+    if remux_result.status.success() {
+        let mp4_data = tokio::fs::read(&output_path)
+            .await
+            .context("Failed to read remuxed MP4 output")?;
+        info!(
+            "MKV -> MP4 remux (stream copy) succeeded ({} bytes -> {} bytes)",
+            data.len(),
+            mp4_data.len()
+        );
+        return Ok(mp4_data);
+    }
+
+    let stderr = String::from_utf8_lossy(&remux_result.stderr);
+    warn!(
+        "Stream-copy remux failed ({}), falling back to reencode",
+        stderr.trim()
+    );
+
+    // Attempt 2: reencode with libx264 + aac
+    info!("Attempting MKV -> MP4 reencode (libx264/aac)");
+    let reencode_result = timeout(
+        FFMPEG_REENCODE_TIMEOUT,
+        Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                input_str,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "mp4",
+                "-y",
+                output_str,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .context("Reencode timed out")?
+    .context("Failed to run ffmpeg for reencode")?;
+
+    if !reencode_result.status.success() {
+        let stderr = String::from_utf8_lossy(&reencode_result.stderr);
+        bail!("ffmpeg reencode failed: {}", stderr.trim());
+    }
+
+    let mp4_data = tokio::fs::read(&output_path)
+        .await
+        .context("Failed to read reencoded MP4 output")?;
+    info!(
+        "MKV -> MP4 reencode succeeded ({} bytes -> {} bytes)",
+        data.len(),
+        mp4_data.len()
+    );
+    Ok(mp4_data)
 }
 
 pub fn generate_blurhash(image_data: &[u8]) -> Result<String> {
