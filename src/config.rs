@@ -7,16 +7,14 @@ use std::time::Duration;
 use url::Url;
 
 const DEFAULT_HOMESERVER_URL: &str = "https://matrix.org";
-
 const DEFAULT_STATE_STORE_PATH: &str = "state";
-
-const DEFAULT_MAX_FILE_SIZE: &str = "26214400"; // 25 MB
-const DEFAULT_DOWNLOAD_TIMEOUT_SECONDS: &str = "30";
+const DEFAULT_MAX_FILE_SIZE: u64 = 26214400; // 25 MB
+const DEFAULT_DOWNLOAD_TIMEOUT_SECONDS: u64 = 30;
 
 fn default_url_rewrites() -> Vec<(regex::Regex, String)> {
     vec![
         (
-            Regex::new(r"^https?://(www\.)?x\.com/").unwrap(),
+            Regex::new(r"^https?://(www\.)?x(cancel)?\.com/").unwrap(),
             "https://vxtwitter.com/".to_string(),
         ),
         (
@@ -39,6 +37,10 @@ pub struct Args {
     #[arg(long)]
     pub password_file: Option<PathBuf>,
 
+    /// Path to a file containing the recovery passphrase
+    #[arg(long)]
+    pub recovery_passphrase_file: Option<PathBuf>,
+
     /// Path to a file containing an access token
     #[arg(long)]
     pub access_token_file: Option<PathBuf>,
@@ -47,11 +49,11 @@ pub struct Args {
     pub state_store_path: PathBuf,
 
     /// Max file size in bytes
-    #[arg(long, default_value = DEFAULT_MAX_FILE_SIZE)]
+    #[arg(long, default_value_t = DEFAULT_MAX_FILE_SIZE)]
     pub max_file_size: u64,
 
     /// Download timeout in seconds
-    #[arg(long, default_value = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS)]
+    #[arg(long, default_value_t = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS)]
     pub download_timeout_seconds: u64,
 
     /// Trusted users who can invite the bot (can be specified multiple times)
@@ -61,6 +63,14 @@ pub struct Args {
     /// Path to a JSON file containing URL rewrite rules
     #[arg(long)]
     pub url_rewrites_file: Option<PathBuf>,
+
+    /// Path to avatar to set, if none is set
+    #[arg(long)]
+    pub avatar_file: Option<PathBuf>,
+
+    /// Proxy to use when making external requests
+    #[arg(long)]
+    pub proxy: Option<Url>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -74,12 +84,15 @@ pub struct Config {
     pub homeserver_url: Url,
     pub username: String,
     pub password: Option<String>,
+    pub recovery_passphrase: Option<String>,
     pub access_token: Option<String>,
     pub state_store_path: PathBuf,
     pub max_file_size: u64,
     pub download_timeout: Duration,
     pub trusted_users: Vec<String>,
     pub url_rewrites: Vec<(regex::Regex, String)>,
+    pub avatar_data: Option<Vec<u8>>,
+    pub proxy: Option<Url>,
 }
 
 impl Config {
@@ -91,6 +104,20 @@ impl Config {
                 tokio::fs::read_to_string(&path)
                     .await
                     .with_context(|| format!("Failed to read password file: {:?}", path))?
+                    .trim()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        let recovery_passphrase = if let Some(path) = args.recovery_passphrase_file {
+            Some(
+                tokio::fs::read_to_string(&path)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to read recovery passphrase file: {:?}", path)
+                    })?
                     .trim()
                     .to_string(),
             )
@@ -129,27 +156,40 @@ impl Config {
             default_url_rewrites()
         };
 
+        let avatar_data = if let Some(path) = args.avatar_file {
+            Some(
+                tokio::fs::read(&path)
+                    .await
+                    .with_context(|| format!("Failed to read avatar file: {:?}", path))?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             homeserver_url: args.homeserver_url,
             username: args.username.unwrap_or_default(),
             password,
+            recovery_passphrase,
             access_token,
             state_store_path: args.state_store_path,
             max_file_size: args.max_file_size,
             download_timeout: Duration::from_secs(args.download_timeout_seconds),
             trusted_users: args.trusted_users,
             url_rewrites,
+            avatar_data,
+            proxy: args.proxy,
         })
     }
 
     pub fn rewrite_url(&self, url: &Url) -> Url {
         let url_str = url.as_str();
         for (regex, replacement) in &self.url_rewrites {
-            if regex.is_match(url_str) {
-                let new_url_str = regex.replace(url_str, replacement);
-                if let Ok(new_url) = Url::parse(&new_url_str) {
-                    return new_url;
-                }
+            let new_url_str = regex.replace(url_str, replacement.as_str());
+            if new_url_str != url_str
+                && let Ok(new_url) = Url::parse(&new_url_str)
+            {
+                return new_url;
             }
         }
         url.clone()
@@ -162,14 +202,15 @@ impl Default for Config {
             homeserver_url: Url::parse(DEFAULT_HOMESERVER_URL).unwrap(),
             username: "".to_string(),
             password: None,
+            recovery_passphrase: None,
             access_token: None,
             state_store_path: PathBuf::from(DEFAULT_STATE_STORE_PATH),
-            max_file_size: DEFAULT_MAX_FILE_SIZE.parse().unwrap(),
-            download_timeout: Duration::from_secs(
-                DEFAULT_DOWNLOAD_TIMEOUT_SECONDS.parse().unwrap(),
-            ),
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
+            download_timeout: Duration::from_secs(DEFAULT_DOWNLOAD_TIMEOUT_SECONDS),
             trusted_users: vec![],
             url_rewrites: default_url_rewrites(),
+            avatar_data: None,
+            proxy: None,
         }
     }
 }

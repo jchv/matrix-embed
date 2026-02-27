@@ -1,6 +1,16 @@
 use anyhow::Result;
 use scraper::{Html, Selector};
+use std::sync::LazyLock;
 use url::Url;
+
+// Match both property="og:..." and name="og:..." since some stuff uses name even though it is non-standard.
+static OPENGRAPH_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(r#"meta[property^="og:"], meta[name^="og:"]"#).unwrap());
+
+// Misskey apparently uses property for twitter meta tags, even though that's only used by opengraph.
+static TWITTER_SELECTOR: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse(r#"meta[property^="twitter:"], meta[name^="twitter:"]"#).unwrap()
+});
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct Metadata {
@@ -18,26 +28,27 @@ impl Metadata {
     }
 
     pub async fn fetch_from_url(client: &reqwest::Client, url: &Url) -> Result<Metadata> {
-        let res = client.get(url.clone()).send().await?;
-        let html_content = res.text().await?;
-
-        Self::parse_from_html(&html_content)
+        Ok(Self::parse_from_html(
+            &client
+                .get(url.clone())
+                .send()
+                .await?
+                .error_for_status()?
+                .text()
+                .await?,
+        ))
     }
 
-    pub fn parse_from_html(html_content: &str) -> Result<Metadata> {
+    pub fn parse_from_html(html_content: &str) -> Metadata {
         let document = Html::parse_document(html_content);
         let mut metadata = Metadata::default();
-
-        Self::parse_og_meta(&document, &mut metadata)?;
-        Self::parse_twitter_meta(&document, &mut metadata)?;
-
-        Ok(metadata)
+        Self::parse_og_meta(&document, &mut metadata);
+        Self::parse_twitter_meta(&document, &mut metadata);
+        metadata
     }
 
-    fn parse_og_meta(document: &Html, metadata: &mut Metadata) -> Result<()> {
-        // Match both property="og:..." and name="og:..." since some stuff uses name even though it is non-standard.
-        let selector = Selector::parse(r#"meta[property^="og:"], meta[name^="og:"]"#).unwrap();
-        for element in document.select(&selector) {
+    fn parse_og_meta(document: &Html, metadata: &mut Metadata) {
+        for element in document.select(&OPENGRAPH_SELECTOR) {
             let prop = element
                 .value()
                 .attr("property")
@@ -67,14 +78,10 @@ impl Metadata {
                 }
             }
         }
-        Ok(())
     }
 
-    fn parse_twitter_meta(document: &Html, metadata: &mut Metadata) -> Result<()> {
-        // Misskey apparently uses property for twitter meta tags, even though that's only used by opengraph.
-        let selector =
-            Selector::parse(r#"meta[property^="twitter:"], meta[name^="twitter:"]"#).unwrap();
-        for element in document.select(&selector) {
+    fn parse_twitter_meta(document: &Html, metadata: &mut Metadata) {
+        for element in document.select(&TWITTER_SELECTOR) {
             if let (Some(name), Some(content)) = (
                 element
                     .value()
@@ -95,17 +102,17 @@ impl Metadata {
                         }
                     }
                     "twitter:image" => {
-                        if metadata.image_url.is_none() {
-                            if let Ok(u) = Url::parse(content) {
-                                metadata.image_url = Some(u);
-                            }
+                        if metadata.image_url.is_none()
+                            && let Ok(u) = Url::parse(content)
+                        {
+                            metadata.image_url = Some(u);
                         }
                     }
                     "twitter:creator" => {
                         if metadata.title.is_none() {
                             let creator = content.to_string();
-                            if creator.starts_with("@") {
-                                metadata.title = Some(creator[1..].to_string());
+                            if let Some(creator) = creator.strip_prefix("@") {
+                                metadata.title = Some(creator.to_string());
                             } else {
                                 metadata.title = Some(creator);
                             }
@@ -115,7 +122,6 @@ impl Metadata {
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -131,7 +137,7 @@ mod tests {
         d.push("tests/data/tweet.html");
 
         let html_content = fs::read_to_string(d).expect("Failed to read test/data/tweet.html");
-        let metadata = Metadata::parse_from_html(&html_content).expect("Failed to parse metadata");
+        let metadata = Metadata::parse_from_html(&html_content);
 
         assert_eq!(metadata.title, Some("ebifurako (@_ebi_furako)".to_string()));
         assert_eq!(

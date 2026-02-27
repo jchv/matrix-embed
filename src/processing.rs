@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::media::{generate_blurhash, generate_thumbnail, probe_media};
 use crate::metadata::Metadata;
 use anyhow::{Result, bail};
-use matrix_sdk::attachment::AttachmentConfig;
+use matrix_sdk::attachment::{AttachmentConfig, BaseAudioInfo, BaseVideoInfo};
 use matrix_sdk::attachment::{BaseImageInfo, Thumbnail};
 use matrix_sdk::ruma::events::room::message::TextMessageEventContent;
 use mime_guess::Mime;
@@ -24,17 +24,17 @@ pub struct AttachmentData {
 }
 
 pub fn process_metadata(meta: Metadata) -> MessageParams {
-    let mut media_url = meta.video_url.or(meta.audio_url).or(meta.image_url);
-
-    if meta.card == Some("summary".to_string()) {
-        media_url = None;
-    }
+    let media_url = if meta.card.as_deref() == Some("summary") {
+        None
+    } else {
+        meta.video_url.or(meta.audio_url).or(meta.image_url)
+    };
 
     let body = format!(
         "{}{}",
         meta.title
             .clone()
-            .map(|s| format!("{}", s))
+            .map(|s| s.to_string())
             .unwrap_or_default(),
         meta.description
             .clone()
@@ -80,10 +80,10 @@ pub async fn process_response(
     text: Option<TextMessageEventContent>,
 ) -> Result<AttachmentData> {
     let content_length = response.content_length();
-    if let Some(len) = content_length {
-        if len > config.max_file_size {
-            bail!("File too large based on Content-Length: {}", len);
-        }
+    if let Some(len) = content_length
+        && len > config.max_file_size
+    {
+        bail!("File too large based on Content-Length: {}", len);
     }
 
     let mut mime_type: Mime = response
@@ -138,31 +138,27 @@ pub async fn process_response(
 
     let mut attachment_config = AttachmentConfig::new();
 
-    match probe_media(&data) {
+    match probe_media(&data).await {
         Ok(info) => {
-            let mut base_info = BaseImageInfo::default();
-            base_info.width = Some(info.width.into());
-            base_info.height = Some(info.height.into());
             debug!("Dimensions: {}x{}", info.width, info.height);
 
             let mut thumbnail_data = None;
             let mut blurhash = None;
 
-            if let Ok(thumb) = generate_thumbnail(&data, 600) {
-                thumbnail_data = Some(thumb.clone());
+            if let Ok(thumb) = generate_thumbnail(&data, 600).await {
                 debug!("Thumbnail generated");
 
                 if let Ok(bh) = generate_blurhash(&thumb) {
                     debug!("Blurhash: {}", bh.clone());
                     blurhash = Some(bh);
                 }
-            }
 
-            base_info.blurhash = blurhash;
+                thumbnail_data = Some(thumb);
+            }
 
             if let Some(thumb) = thumbnail_data {
                 let thumb_mime: Mime = "image/jpeg".parse().unwrap();
-                let (thumb_width, thumb_height) = if let Ok(info) = probe_media(&thumb) {
+                let (thumb_width, thumb_height) = if let Ok(info) = probe_media(&thumb).await {
                     (Some(info.width.into()), Some(info.height.into()))
                 } else {
                     (None, None)
@@ -183,20 +179,29 @@ pub async fn process_response(
 
             // Add the info to the specific config type
             if mime_type.type_() == mime_guess::mime::IMAGE {
-                attachment_config = attachment_config
-                    .info(matrix_sdk::attachment::AttachmentInfo::Image(base_info));
+                attachment_config = attachment_config.info(
+                    matrix_sdk::attachment::AttachmentInfo::Image(BaseImageInfo {
+                        width: Some(info.width.into()),
+                        height: Some(info.height.into()),
+                        blurhash,
+                        ..Default::default()
+                    }),
+                );
             } else if mime_type.type_() == mime_guess::mime::VIDEO {
-                let mut video_info = matrix_sdk::attachment::BaseVideoInfo::default();
-                video_info.width = Some(info.width.into());
-                video_info.height = Some(info.height.into());
-                video_info.blurhash = base_info.blurhash;
-
-                attachment_config = attachment_config
-                    .info(matrix_sdk::attachment::AttachmentInfo::Video(video_info));
+                attachment_config = attachment_config.info(
+                    matrix_sdk::attachment::AttachmentInfo::Video(BaseVideoInfo {
+                        width: Some(info.width.into()),
+                        height: Some(info.height.into()),
+                        blurhash,
+                        ..Default::default()
+                    }),
+                );
             } else if mime_type.type_() == mime_guess::mime::AUDIO {
-                let audio_info = matrix_sdk::attachment::BaseAudioInfo::default();
-                attachment_config = attachment_config
-                    .info(matrix_sdk::attachment::AttachmentInfo::Audio(audio_info));
+                attachment_config = attachment_config.info(
+                    matrix_sdk::attachment::AttachmentInfo::Audio(BaseAudioInfo {
+                        ..Default::default()
+                    }),
+                );
             }
         }
         Err(e) => {
@@ -228,15 +233,13 @@ pub async fn process_response(
         }
     }
 
-    if found_name.is_none() {
-        if let Some(name) = final_url
+    if found_name.is_none()
+        && let Some(name) = final_url
             .path_segments()
-            .and_then(|segments| segments.last())
-        {
-            if !name.is_empty() {
-                found_name = Some(name.to_string());
-            }
-        }
+            .and_then(|mut segments| segments.next_back())
+        && !name.is_empty()
+    {
+        found_name = Some(name.to_string());
     }
 
     if let Some(mut name) = found_name {

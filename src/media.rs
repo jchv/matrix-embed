@@ -1,7 +1,16 @@
 use anyhow::{Context, Result, bail};
 use image::GenericImageView;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+use tokio::time::timeout;
+
+const FFPROBE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const FFPROBE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+const FFMPEG_THUMBNAIL_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const FFMPEG_THUMBNAIL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct MediaInfo {
@@ -11,9 +20,9 @@ pub struct MediaInfo {
 
 /// Probes media dimensions using ffprobe via stdin/stdout.
 /// Runs: ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 -
-pub fn probe_media(data: &[u8]) -> Result<MediaInfo> {
+pub async fn probe_media(data: &[u8]) -> Result<MediaInfo> {
     let mut child = Command::new("ffprobe")
-        .args(&[
+        .args([
             "-v",
             "error",
             "-select_streams",
@@ -30,16 +39,15 @@ pub fn probe_media(data: &[u8]) -> Result<MediaInfo> {
         .spawn()
         .context("Failed to spawn ffprobe")?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(data) {
-            if e.kind() != std::io::ErrorKind::BrokenPipe {
-                return Err(e).context("Failed to write to ffprobe stdin");
-            }
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(e) = timeout(FFPROBE_WRITE_TIMEOUT, stdin.write_all(data)).await?
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        return Err(e).context("Failed to write to ffprobe stdin");
     }
 
-    let output = child
-        .wait_with_output()
+    let output = timeout(FFPROBE_READ_TIMEOUT, child.wait_with_output())
+        .await?
         .context("Failed to wait on ffprobe")?;
 
     if !output.status.success() {
@@ -67,9 +75,9 @@ pub fn probe_media(data: &[u8]) -> Result<MediaInfo> {
 
 /// Generates a thumbnail using ffmpeg via stdin/stdout.
 /// Runs: ffmpeg -i - -ss 00:00:00 -vframes 1 -vf scale={target_width}:-1 -f image2 -c:v mjpeg -
-pub fn generate_thumbnail(data: &[u8], target_width: u32) -> Result<Vec<u8>> {
+pub async fn generate_thumbnail(data: &[u8], target_width: u32) -> Result<Vec<u8>> {
     let mut child = Command::new("ffmpeg")
-        .args(&[
+        .args([
             "-hide_banner",
             "-loglevel",
             "error",
@@ -93,16 +101,15 @@ pub fn generate_thumbnail(data: &[u8], target_width: u32) -> Result<Vec<u8>> {
         .spawn()
         .context("Failed to spawn ffmpeg")?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(data) {
-            if e.kind() != std::io::ErrorKind::BrokenPipe {
-                return Err(e).context("Failed to write to ffmpeg stdin");
-            }
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(e) = timeout(FFMPEG_THUMBNAIL_WRITE_TIMEOUT, stdin.write_all(data)).await?
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        return Err(e).context("Failed to write to ffmpeg stdin");
     }
 
-    let output = child
-        .wait_with_output()
+    let output = timeout(FFMPEG_THUMBNAIL_READ_TIMEOUT, child.wait_with_output())
+        .await?
         .context("Failed to wait on ffmpeg")?;
 
     if !output.status.success() {
@@ -117,9 +124,7 @@ pub fn generate_blurhash(image_data: &[u8]) -> Result<String> {
     let img = image::load_from_memory(image_data).context("Failed to load image for blurhash")?;
     let (width, height) = img.dimensions();
 
-    blurhash::encode(4, 3, width, height, &img.to_rgba8())
-        .context("Failed to generate blurhash")
-        .map_err(|e| e.into())
+    blurhash::encode(4, 3, width, height, &img.to_rgba8()).context("Failed to generate blurhash")
 }
 
 #[cfg(test)]
@@ -135,22 +140,24 @@ mod tests {
         d
     }
 
-    #[test]
-    fn test_probe_media() {
+    #[tokio::test]
+    async fn test_probe_media() {
         let path = get_test_file_path("big_buck_bunny.webm");
         let data = fs::read(&path).expect("Failed to read test file");
 
-        let info = probe_media(&data).expect("Failed to probe media");
+        let info = probe_media(&data).await.expect("Failed to probe media");
         assert_eq!(info.width, 1280);
         assert_eq!(info.height, 720);
     }
 
-    #[test]
-    fn test_generate_thumbnail() {
+    #[tokio::test]
+    async fn test_generate_thumbnail() {
         let path = get_test_file_path("big_buck_bunny.webm");
         let data = fs::read(&path).expect("Failed to read test file");
 
-        let thumb_data = generate_thumbnail(&data, 320).expect("Failed to generate thumbnail");
+        let thumb_data = generate_thumbnail(&data, 320)
+            .await
+            .expect("Failed to generate thumbnail");
         assert!(!thumb_data.is_empty());
 
         // Verify thumbnail is a valid image and has correct width
@@ -158,12 +165,14 @@ mod tests {
         assert_eq!(img.width(), 320);
     }
 
-    #[test]
-    fn test_generate_blurhash() {
+    #[tokio::test]
+    async fn test_generate_blurhash() {
         // First generate a thumbnail to use for blurhash
         let path = get_test_file_path("big_buck_bunny.webm");
         let data = fs::read(&path).expect("Failed to read test file");
-        let thumb_data = generate_thumbnail(&data, 320).expect("Failed to generate thumbnail");
+        let thumb_data = generate_thumbnail(&data, 320)
+            .await
+            .expect("Failed to generate thumbnail");
 
         let hash = generate_blurhash(&thumb_data).expect("Failed to generate blurhash");
         assert!(!hash.is_empty());

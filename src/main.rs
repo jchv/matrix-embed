@@ -15,6 +15,8 @@ use matrix_sdk::{
     store::RoomLoadSettings,
 };
 use metadata::Metadata;
+use mime_guess::Mime;
+use reqwest::Proxy;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::BufReader;
@@ -134,10 +136,18 @@ async fn main() -> Result<()> {
         warn!("No credentials provided.");
     }
 
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
+
     let config = Arc::new(config);
-    let http_client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)")
-        .build()?;
+    let mut http_builder = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)");
+    if let Some(proxy) = config.proxy.clone() {
+        http_builder = http_builder.proxy(Proxy::all(proxy)?);
+    }
+    let http_client = http_builder.build()?;
 
     // Event Handler
     client.add_event_handler({
@@ -185,6 +195,27 @@ async fn main() -> Result<()> {
         }
     });
 
+    // By this point, we should be authenticated. Set up any initial account configuration if needed.
+    info!("Configuring any relevant account settings if needed...");
+
+    if let Some(avatar_data) = config.avatar_data.clone()
+        && client
+            .account()
+            .get_avatar_url()
+            .await
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        info!("No avatar set. Setting avatar.");
+        let kind = infer::get(&avatar_data)
+            .map(|t| t.mime_type())
+            .unwrap_or("image/png")
+            .parse::<Mime>()?;
+        client.account().upload_avatar(&kind, avatar_data).await?;
+        info!("Avatar should be good to go now.")
+    }
+
     info!("Bot started, syncing...");
     client.sync(SyncSettings::default()).await?;
 
@@ -204,16 +235,17 @@ async fn handle_message(
 
     let body = msgtype.body;
     for word in body.split_whitespace() {
-        if word.starts_with("http://") || word.starts_with("https://") {
-            if let Ok(url) = Url::parse(word) {
-                // Apply URL rewrites
-                let url = config.rewrite_url(&url);
-                debug!("Found URL: {}", url);
-                if let Err(e) = process_url(&http_client, &room, &config, &url).await {
-                    warn!("Failed to process URL {}: {:?}", url, e);
-                }
-                break;
+        if (word.starts_with("http://") || word.starts_with("https://"))
+            && let Ok(url) = Url::parse(word)
+        {
+            // Apply URL rewrites
+            let url = config.rewrite_url(&url);
+            debug!("Found URL: {}", url);
+            if let Err(e) = process_url(&http_client, &room, &config, &url).await {
+                warn!("Failed to process URL {}: {:?}", url, e);
             }
+            // Only process the first URL found (for now?)
+            break;
         }
     }
 
