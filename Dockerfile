@@ -17,4 +17,4 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 COPY --from=builder /app/target/release/matrix-embed /matrix-embed
 VOLUME ["/data"]
-CMD ["/matrix-embed"]
+ENTRYPOINT ["/matrix-embed"]
