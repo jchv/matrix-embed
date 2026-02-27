@@ -5,15 +5,11 @@ use matrix_sdk::{
     authentication::{SessionTokens, matrix::MatrixSession},
     config::SyncSettings,
     room::{Room, reply::Reply},
-    ruma::events::{
-        relation::Replacement,
-        room::{
-            member::{MembershipState, StrippedRoomMemberEvent},
-            message::{
-                AddMentions, ForwardThread, MessageType, OriginalSyncRoomMessageEvent, Relation,
-                RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
-                TextMessageEventContent,
-            },
+    ruma::events::room::{
+        member::{MembershipState, StrippedRoomMemberEvent},
+        message::{
+            AddMentions, ForwardThread, MessageType, OriginalSyncRoomMessageEvent,
+            RoomMessageEventContent, TextMessageEventContent,
         },
     },
     store::RoomLoadSettings,
