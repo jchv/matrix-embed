@@ -272,7 +272,7 @@ async fn process_url(
                 return Ok(());
             }
             let params = process_metadata(meta, config);
-            post_message(http_client, room, config, params, reply).await?;
+            post_message(http_client, room, config, params, reply, url).await?;
         }
         Err(e) => {
             warn!("Failed to fetch metadata for {}: {:?}", url, e);
@@ -307,6 +307,7 @@ async fn post_message(
     config: &Config,
     params: MessageParams,
     reply: OriginalSyncRoomMessageEvent,
+    referer: &Url,
 ) -> Result<()> {
     let has_text = !params.body.is_empty() || !params.html_body.is_empty();
 
@@ -330,6 +331,7 @@ async fn post_message(
                 &media_url,
                 config,
                 caption,
+                Some(referer),
                 Reply {
                     event_id: reply.event_id.clone(),
                     enforce_thread: matrix_sdk::room::reply::EnforceThread::MaybeThreaded,
@@ -369,14 +371,14 @@ pub async fn download_and_upload(
     url: &Url,
     config: &Config,
     text: Option<TextMessageEventContent>,
+    referer: Option<&Url>,
     reply: Reply,
 ) -> Result<()> {
-    let response = client
-        .get(url.clone())
-        .timeout(config.download_timeout)
-        .send()
-        .await
-        .context("Failed to start download")?;
+    let mut request = client.get(url.clone()).timeout(config.download_timeout);
+    if let Some(referer) = referer {
+        request = request.header(reqwest::header::REFERER, referer.as_str());
+    }
+    let response = request.send().await.context("Failed to start download")?;
 
     let attachment = process_response(response, config, text).await?;
 
