@@ -24,6 +24,39 @@ pub struct AttachmentData {
     pub attachment_config: AttachmentConfig,
 }
 
+/// Truncates text to fit within the given character and line limits.
+/// Appends "…" if the text was truncated.
+fn truncate_text(text: &str, max_chars: usize, max_lines: usize) -> String {
+    let mut result = String::new();
+    let mut char_count = 0;
+    let mut line_count = 1;
+    let mut truncated = false;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            if line_count >= max_lines {
+                truncated = true;
+                break;
+            }
+            line_count += 1;
+        }
+
+        char_count += 1;
+        if char_count > max_chars {
+            truncated = true;
+            break;
+        }
+
+        result.push(ch);
+    }
+
+    if truncated {
+        format!("{}…", result.trim_end())
+    } else {
+        result
+    }
+}
+
 pub fn process_metadata(meta: Metadata, config: &Config) -> MessageParams {
     let media_url = match meta.card.as_deref() {
         Some("summary") => None,
@@ -38,7 +71,13 @@ pub fn process_metadata(meta: Metadata, config: &Config) -> MessageParams {
             .iter()
             .any(|re| re.is_match(t))
     });
-    let description = meta.description;
+    let description = meta.description.map(|d| {
+        truncate_text(
+            &d,
+            config.max_embed_description_chars,
+            config.max_embed_description_lines,
+        )
+    });
     let has_title = title.is_some();
     let has_desc = description.is_some();
 
@@ -361,5 +400,64 @@ mod tests {
 
         assert_eq!(attachment.mime_type.to_string(), "video/webm");
         assert_eq!(attachment.filename, "media.webm");
+    }
+
+    #[test]
+    fn test_truncate_text_no_op() {
+        assert_eq!(truncate_text("hello", 640, 8), "hello");
+        assert_eq!(truncate_text("", 640, 8), "");
+        assert_eq!(truncate_text("one\ntwo\nthree", 640, 8), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn test_truncate_text_exact_boundary() {
+        // Exactly at the char limit — no truncation
+        assert_eq!(truncate_text("abcde", 5, 8), "abcde");
+        // Exactly at the line limit — no truncation
+        assert_eq!(truncate_text("a\nb\nc", 640, 3), "a\nb\nc");
+    }
+
+    #[test]
+    fn test_truncate_text_char_limit() {
+        assert_eq!(truncate_text("abcdef", 5, 8), "abcde…");
+        assert_eq!(
+            truncate_text("hello world, this is long", 11, 8),
+            "hello world…"
+        );
+    }
+
+    #[test]
+    fn test_truncate_text_line_limit() {
+        assert_eq!(truncate_text("a\nb\nc\nd", 640, 2), "a\nb…");
+        assert_eq!(truncate_text("line1\nline2\nline3", 640, 1), "line1…");
+    }
+
+    #[test]
+    fn test_truncate_text_char_limit_wins() {
+        // 10 chars hits before 8 lines
+        assert_eq!(truncate_text("aaa\nbbb\nccc\nddd", 10, 8), "aaa\nbbb\ncc…");
+    }
+
+    #[test]
+    fn test_truncate_text_line_limit_wins() {
+        // 2 lines hits before 640 chars
+        assert_eq!(
+            truncate_text("short\nlines\nextra", 640, 2),
+            "short\nlines…"
+        );
+    }
+
+    #[test]
+    fn test_truncate_text_trims_trailing_whitespace() {
+        assert_eq!(truncate_text("hello   world", 8, 8), "hello…");
+        assert_eq!(truncate_text("aaa \n bbb\nccc", 640, 2), "aaa \n bbb…");
+    }
+
+    #[test]
+    fn test_truncate_text_unicode() {
+        // Each emoji is 1 char
+        assert_eq!(truncate_text("🎉🎊🎈🎁🎂🎄", 4, 8), "🎉🎊🎈🎁…");
+        assert_eq!(truncate_text("café", 4, 8), "café");
+        assert_eq!(truncate_text("café!", 4, 8), "café…");
     }
 }

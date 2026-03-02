@@ -244,6 +244,11 @@ async fn handle_message(
         if (word.starts_with("http://") || word.starts_with("https://"))
             && let Ok(url) = Url::parse(word)
         {
+            if config.is_url_ignored(&url) {
+                debug!("Ignoring URL (matched ignored pattern): {}", url);
+                continue;
+            }
+
             // Apply URL rewrites
             let url = config.rewrite_url(&url);
             debug!("Found URL: {}", url);

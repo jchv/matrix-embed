@@ -10,9 +10,15 @@ const DEFAULT_HOMESERVER_URL: &str = "https://matrix.org";
 const DEFAULT_STATE_STORE_PATH: &str = "state";
 const DEFAULT_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_DOWNLOAD_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_MAX_EMBED_DESCRIPTION_CHARS: usize = 640;
+const DEFAULT_MAX_EMBED_DESCRIPTION_LINES: usize = 8;
 
 fn default_ignored_title_patterns() -> Vec<Regex> {
     vec![Regex::new(r"^(Image|Video|Audio) File$").unwrap()]
+}
+
+fn default_ignored_url_patterns() -> Vec<Regex> {
+    vec![Regex::new(r"^https?://(www\.)?matrix\.to/").unwrap()]
 }
 
 fn default_url_rewrites() -> Vec<(regex::Regex, String)> {
@@ -83,6 +89,18 @@ pub struct Args {
     /// Regular expressions for og:title values that should be ignored (can be specified multiple times)
     #[arg(long)]
     pub ignored_title_pattern: Vec<String>,
+
+    /// Regular expressions for URLs that should be skipped entirely (can be specified multiple times)
+    #[arg(long)]
+    pub ignored_url_pattern: Vec<String>,
+
+    /// Maximum number of characters allowed in an embed description
+    #[arg(long, default_value_t = DEFAULT_MAX_EMBED_DESCRIPTION_CHARS)]
+    pub max_embed_description_chars: usize,
+
+    /// Maximum number of lines allowed in an embed description
+    #[arg(long, default_value_t = DEFAULT_MAX_EMBED_DESCRIPTION_LINES)]
+    pub max_embed_description_lines: usize,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -104,6 +122,9 @@ pub struct Config {
     pub trusted_users: Vec<String>,
     pub url_rewrites: Vec<(regex::Regex, String)>,
     pub ignored_title_patterns: Vec<Regex>,
+    pub ignored_url_patterns: Vec<Regex>,
+    pub max_embed_description_chars: usize,
+    pub max_embed_description_lines: usize,
     pub avatar_data: Option<Vec<u8>>,
     pub proxy: Option<Url>,
     pub reset_identity: bool,
@@ -182,6 +203,18 @@ impl Config {
                 .collect::<Result<Vec<_>>>()?
         };
 
+        let ignored_url_patterns = if args.ignored_url_pattern.is_empty() {
+            default_ignored_url_patterns()
+        } else {
+            args.ignored_url_pattern
+                .iter()
+                .map(|p| {
+                    Regex::new(p)
+                        .with_context(|| format!("Invalid ignored URL pattern regex: {}", p))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
         let avatar_data = if let Some(path) = args.avatar_file {
             Some(
                 tokio::fs::read(&path)
@@ -204,10 +237,20 @@ impl Config {
             trusted_users: args.trusted_users,
             url_rewrites,
             ignored_title_patterns,
+            ignored_url_patterns,
+            max_embed_description_chars: args.max_embed_description_chars,
+            max_embed_description_lines: args.max_embed_description_lines,
             avatar_data,
             proxy: args.proxy,
             reset_identity: args.reset_identity,
         })
+    }
+
+    pub fn is_url_ignored(&self, url: &Url) -> bool {
+        let url_str = url.as_str();
+        self.ignored_url_patterns
+            .iter()
+            .any(|re| re.is_match(url_str))
     }
 
     pub fn rewrite_url(&self, url: &Url) -> Url {
@@ -238,6 +281,9 @@ impl Default for Config {
             trusted_users: vec![],
             url_rewrites: default_url_rewrites(),
             ignored_title_patterns: default_ignored_title_patterns(),
+            ignored_url_patterns: default_ignored_url_patterns(),
+            max_embed_description_chars: DEFAULT_MAX_EMBED_DESCRIPTION_CHARS,
+            max_embed_description_lines: DEFAULT_MAX_EMBED_DESCRIPTION_LINES,
             avatar_data: None,
             proxy: None,
             reset_identity: false,
@@ -264,5 +310,20 @@ mod tests {
         let url = Url::parse("https://google.com").unwrap();
         let new_url = config.rewrite_url(&url);
         assert_eq!(new_url.as_str(), "https://google.com/");
+    }
+
+    #[test]
+    fn test_is_url_ignored() {
+        let config = Config::default();
+
+        assert!(
+            config.is_url_ignored(&Url::parse("https://matrix.to/#/@user:example.com").unwrap())
+        );
+        assert!(
+            config
+                .is_url_ignored(&Url::parse("https://www.matrix.to/#/!room:example.com").unwrap())
+        );
+        assert!(!config.is_url_ignored(&Url::parse("https://example.com/page").unwrap()));
+        assert!(!config.is_url_ignored(&Url::parse("https://notmatrix.to/something").unwrap()));
     }
 }
