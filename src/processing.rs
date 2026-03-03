@@ -103,7 +103,7 @@ pub fn process_metadata(meta: Metadata, config: &Config) -> MessageParams {
             "{}<blockquote>{}{}</blockquote>",
             if media_url.is_some() { "<br/>" } else { "" },
             html_title
-                .map(|s| format!("<strong>{}{}</strong>", s, if has_desc { ":" } else { "" }))
+                .map(|s| format!("<strong>{}</strong>", s))
                 .unwrap_or_default(),
             html_desc
                 .map(|s| format!("<p>{}</p>", s))
@@ -359,7 +359,7 @@ mod tests {
         let params = process_metadata(meta, &Config::default());
 
         assert_eq!(params.body, "Test Title: Test Description");
-        assert!(params.html_body.contains("<strong>Test Title:</strong>"));
+        assert!(params.html_body.contains("<strong>Test Title</strong>"));
         assert!(params.html_body.contains("<p>Test Description</p>"));
         assert_eq!(
             params.media_url.unwrap().as_str(),
