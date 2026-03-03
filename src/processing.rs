@@ -217,7 +217,7 @@ pub async fn process_response(
             }
 
             if let Some(thumb) = thumbnail_data {
-                let thumb_mime: Mime = "image/jpeg".parse().unwrap();
+                let thumb_mime: Mime = "image/webp".parse().unwrap();
                 let (thumb_width, thumb_height) = if let Ok(info) = probe_media(&thumb).await {
                     (Some(info.width.into()), Some(info.height.into()))
                 } else {

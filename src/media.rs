@@ -79,7 +79,7 @@ pub async fn probe_media(data: &[u8]) -> Result<MediaInfo> {
 }
 
 /// Generates a thumbnail using ffmpeg via stdin/stdout.
-/// Runs: ffmpeg -i - -ss 00:00:00 -vframes 1 -vf scale={target_width}:-1 -f image2 -c:v mjpeg -
+/// Runs: ffmpeg -i - -ss 00:00:00 -vframes 1 -vf scale={target_width}:-1 -f webp -c:v libwebp -
 pub async fn generate_thumbnail(data: &[u8], target_width: u32) -> Result<Vec<u8>> {
     let mut child = Command::new("ffmpeg")
         .args([
@@ -95,9 +95,9 @@ pub async fn generate_thumbnail(data: &[u8], target_width: u32) -> Result<Vec<u8
             "-vf",
             &format!("scale={}:-1", target_width),
             "-f",
-            "image2",
+            "webp",
             "-c:v",
-            "mjpeg",
+            "libwebp",
             "-",
         ])
         .stdin(Stdio::piped())
