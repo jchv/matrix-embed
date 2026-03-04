@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use scraper::{Html, Selector};
 use std::sync::LazyLock;
+use tracing::{debug, warn};
 use url::Url;
 
 // Match both property="og:..." and name="og:..." since some stuff uses name even though it is non-standard.
@@ -28,6 +29,58 @@ impl Metadata {
     }
 
     pub async fn fetch_from_url(client: &reqwest::Client, url: &Url) -> Result<Metadata> {
+        let content_type = match client.head(url.clone()).send().await {
+            Ok(resp) => {
+                if let Err(e) = resp.error_for_status_ref() {
+                    debug!("HEAD request returned error status for {}: {}", url, e);
+                    None
+                } else {
+                    resp.headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string())
+                }
+            }
+            Err(e) => {
+                warn!("HEAD request failed for {}: {}", url, e);
+                None
+            }
+        };
+
+        // Handle direct links to media.
+        if let Some(ct) = &content_type {
+            let mime_type = ct.split(';').next().unwrap_or("").trim();
+            debug!("HEAD Content-Type for {}: {}", url, mime_type);
+
+            match mime_type.split('/').next().unwrap_or("") {
+                "image" => {
+                    return Ok(Metadata {
+                        image_url: Some(url.clone()),
+                        ..Default::default()
+                    });
+                }
+                "video" => {
+                    return Ok(Metadata {
+                        video_url: Some(url.clone()),
+                        ..Default::default()
+                    });
+                }
+                "audio" => {
+                    return Ok(Metadata {
+                        audio_url: Some(url.clone()),
+                        ..Default::default()
+                    });
+                }
+                _ => {
+                    if mime_type != "text/html" && mime_type != "application/xhtml+xml" {
+                        bail!("Unsupported content type: {}", mime_type);
+                    }
+                }
+            }
+        }
+
+        // Either it was HTML, or we couldn't determine the type — fetch and
+        // parse as HTML.
         Ok(Self::parse_from_html(
             &client
                 .get(url.clone())
