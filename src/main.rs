@@ -28,6 +28,7 @@ use url::Url;
 
 use crate::processing::{MessageParams, process_metadata, process_response};
 
+mod command;
 mod config;
 mod media;
 mod metadata;
@@ -159,10 +160,12 @@ async fn main() -> Result<()> {
     client.add_event_handler({
         let config = config.clone();
         let http_client = http_client.clone();
+        let client = client.clone();
 
         move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let config = config.clone();
             let http_client = http_client.clone();
+            let client = client.clone();
             debug!("Event: {:?}", event);
             async move {
                 // Ignore own messages
@@ -170,7 +173,7 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                if let Err(e) = handle_message(event, room, config, http_client).await {
+                if let Err(e) = handle_message(event, room, config, http_client, client).await {
                     error!("Error handling message: {:?}", e);
                 }
             }
@@ -233,6 +236,7 @@ async fn handle_message(
     room: Room,
     config: Arc<Config>,
     http_client: reqwest::Client,
+    client: Client,
 ) -> Result<()> {
     let msgtype = match event.content.msgtype.clone() {
         MessageType::Text(t) => t,
@@ -240,6 +244,22 @@ async fn handle_message(
     };
 
     let body = msgtype.body;
+
+    // Check for bot commands before URL processing
+    match command::handle_command(&body, event.sender.as_str(), &config, &client).await {
+        command::CommandResult::Response(response) => {
+            // TODO: use text_markdown? Requires SDK feature that is disabled.
+            room.send(RoomMessageEventContent::text_plain(response).make_reply_to(
+                &event,
+                ForwardThread::Yes,
+                AddMentions::No,
+            ))
+            .await?;
+            return Ok(());
+        }
+        command::CommandResult::NotACommand => {}
+    }
+
     for word in body.split_whitespace() {
         if (word.starts_with("http://") || word.starts_with("https://"))
             && let Ok(url) = Url::parse(word)
