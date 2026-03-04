@@ -1,5 +1,7 @@
 use crate::config::Config;
-use crate::media::{generate_blurhash, generate_thumbnail, probe_media, remux_to_mp4};
+use crate::media::{
+    generate_blurhash, generate_thumbnail, probe_is_animated, probe_media, remux_to_mp4,
+};
 use crate::metadata::Metadata;
 use anyhow::{Result, bail};
 use matrix_sdk::attachment::{AttachmentConfig, BaseAudioInfo, BaseVideoInfo};
@@ -239,11 +241,13 @@ pub async fn process_response(
 
             // Add the info to the specific config type
             if mime_type.type_() == mime_guess::mime::IMAGE {
+                let is_animated = probe_is_animated(&data);
                 attachment_config = attachment_config.info(
                     matrix_sdk::attachment::AttachmentInfo::Image(BaseImageInfo {
                         width: Some(info.width.into()),
                         height: Some(info.height.into()),
                         blurhash,
+                        is_animated,
                         ..Default::default()
                     }),
                 );

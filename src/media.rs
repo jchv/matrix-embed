@@ -250,6 +250,59 @@ pub async fn remux_to_mp4(data: &[u8]) -> Result<Vec<u8>> {
     Ok(mp4_data)
 }
 
+pub fn probe_is_animated(data: &[u8]) -> Option<bool> {
+    // JPEG, BMP
+    if data.starts_with(b"\xFF\xD8\xFF") || data.starts_with(b"BM") {
+        return Some(false);
+    }
+
+    // GIF87a, GIF89a. GIF87a shouldn't contain animations, but... but sometimes it does.
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        // Note: This doesn't actually check to ensure there are multiple frames.
+        return Some(
+            data[..data.len().min(1024)]
+                .windows(11)
+                .any(|w| w == b"NETSCAPE2.0" || w == b"ANIMEXTS1.0"),
+        );
+    }
+
+    // PNG
+    if data.starts_with(b"\x89PNG\r\n\x1A\n") {
+        let mut i = 8;
+        let mut j = 0;
+        while i + 8 <= data.len() {
+            let len = u32::from_be_bytes(data[i..i + 4].try_into().unwrap()) as usize;
+            let chunk_type = &data[i + 4..i + 8];
+            if chunk_type == b"acTL" {
+                return Some(true);
+            } else if chunk_type == b"IDAT" {
+                // No acTL block before IDAT
+                return Some(false);
+            }
+            i += 12 + len;
+            j += 1;
+
+            if j > 1000 {
+                // Bail early if there are too many blocks.
+                return Some(false);
+            }
+        }
+        return Some(false);
+    }
+
+    // WebP (RIFF container)
+    if data.starts_with(b"RIFF") && data.len() >= 12 && &data[8..12] == b"WEBP" {
+        if data.len() >= 21 && &data[12..16] == b"VP8X" {
+            // Animation flag is bit 1 of the VP8X flags.
+            return Some((data[20] & 0x02) != 0);
+        }
+        return Some(false);
+    }
+
+    // Indeterminate. Currently AVIF and JXL are indeterminate.
+    None
+}
+
 pub fn generate_blurhash(image_data: &[u8]) -> Result<String> {
     let img = image::load_from_memory(image_data).context("Failed to load image for blurhash")?;
     let (width, height) = img.dimensions();
@@ -306,5 +359,47 @@ mod tests {
 
         let hash = generate_blurhash(&thumb_data).expect("Failed to generate blurhash");
         assert!(!hash.is_empty());
+    }
+
+    #[test]
+    fn test_probe_is_animated_gif_animated() {
+        let path = get_test_file_path("me-animated.gif");
+        let data = fs::read(&path).expect("Failed to read test file");
+        assert_eq!(probe_is_animated(&data), Some(true));
+    }
+
+    #[test]
+    fn test_probe_is_animated_gif_static() {
+        let path = get_test_file_path("me-static.gif");
+        let data = fs::read(&path).expect("Failed to read test file");
+        assert_eq!(probe_is_animated(&data), Some(false));
+    }
+
+    #[test]
+    fn test_probe_is_animated_webp_animated() {
+        let path = get_test_file_path("me-animated.webp");
+        let data = fs::read(&path).expect("Failed to read test file");
+        assert_eq!(probe_is_animated(&data), Some(true));
+    }
+
+    #[test]
+    fn test_probe_is_animated_webp_static() {
+        let path = get_test_file_path("me-static.webp");
+        let data = fs::read(&path).expect("Failed to read test file");
+        assert_eq!(probe_is_animated(&data), Some(false));
+    }
+
+    #[test]
+    fn test_probe_is_animated_png_animated() {
+        let path = get_test_file_path("me-animated.png");
+        let data = fs::read(&path).expect("Failed to read test file");
+        assert_eq!(probe_is_animated(&data), Some(true));
+    }
+
+    #[test]
+    fn test_probe_is_animated_png_static() {
+        let path = get_test_file_path("me-static.png");
+        let data = fs::read(&path).expect("Failed to read test file");
+        assert_eq!(probe_is_animated(&data), Some(false));
     }
 }
