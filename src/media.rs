@@ -79,7 +79,7 @@ pub async fn probe_media(data: &[u8]) -> Result<MediaInfo> {
 }
 
 /// Generates a thumbnail using ffmpeg via stdin/stdout.
-/// Runs: ffmpeg -i - -ss 00:00:00 -vframes 1 -vf scale={target_width}:-1 -pix_fmt yuva420p -f webp -c:v libwebp -
+/// Runs: ffmpeg -i - -ss 00:00:00 -vframes 1 -vf scale='min({target_width},iw)':-1 -pix_fmt yuva420p -f webp -c:v libwebp -
 pub async fn generate_thumbnail(data: &[u8], target_width: u32) -> Result<Vec<u8>> {
     let mut child = Command::new("ffmpeg")
         .args([
@@ -93,7 +93,7 @@ pub async fn generate_thumbnail(data: &[u8], target_width: u32) -> Result<Vec<u8
             "-vframes",
             "1",
             "-vf",
-            &format!("scale={}:-1", target_width),
+            &format!("scale='min({},iw)':-1", target_width),
             // Experimental: force a non-indexed color mode since some clients do not like indexed colors
             "-pix_fmt",
             "yuva420p",
