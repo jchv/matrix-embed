@@ -1,4 +1,4 @@
-FROM docker.io/library/rust:1-bookworm AS builder
+FROM docker.io/library/rust:1-trixie AS builder
 WORKDIR /app
 COPY Cargo.lock Cargo.toml /app/
 RUN apt-get update && apt-get install -y \
@@ -12,7 +12,7 @@ RUN mkdir -p /app/src && \
 COPY . .
 RUN cargo build --release
 
-FROM docker.io/library/debian:bookworm-slim
+FROM docker.io/library/debian:trixie-slim
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     ca-certificates \
