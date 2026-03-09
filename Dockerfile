@@ -1,4 +1,4 @@
-FROM docker.io/library/rust:1-trixie AS builder
+FROM docker.io/library/rust:1.93.1-trixie AS builder
 WORKDIR /app
 COPY Cargo.lock Cargo.toml /app/
 RUN apt-get update && apt-get install -y \
