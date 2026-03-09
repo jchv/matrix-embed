@@ -35,11 +35,18 @@ pub async fn handle_command(
 }
 
 fn usage_root() -> String {
-    "Usage: `!embedbot <subcommand>`\n\nAvailable subcommands:\n- `admin` — Admin commands (trusted users only)".to_string()
+    "Usage: `!embedbot <subcommand>`\n\n\
+Available subcommands:\n\
+- `admin` — Admin commands (trusted users only)"
+        .to_string()
 }
 
 fn usage_admin() -> String {
-    "Usage: `!embedbot admin <subcommand>`\n\nAvailable subcommands:\n- `remove-device <device_id>` — Remove a device from this bot's account\n- `reset-identity` — Reset crypto identity, set up recovery key and enable backups".to_string()
+    "Usage: `!embedbot admin <subcommand>`\n\n\
+Available subcommands:\n\
+- `remove-device <device_id>` — Remove a device from this bot's account\n\
+- `reset-identity` — Reset cryptographic identity, set up recovery key and enable backups"
+        .to_string()
 }
 
 async fn handle_admin(
@@ -96,9 +103,7 @@ async fn handle_reset_identity(config: &Config, client: &Client) -> CommandResul
         Ok(recovery_key) => {
             info!("Successfully reset identity and enabled recovery");
             CommandResult::Response(format!(
-                "Cryptographic identity has been reset, backups enabled, and a new recovery key has been created.\n\n\
-                 **Recovery key:** `{}`\n\n\
-                 ⚠️ Save this key somewhere safe — it is the only way to recover encrypted message history.",
+                "Cryptographic identity has been reset.\n\n**New recovery key:** `{}`",
                 recovery_key
             ))
         }

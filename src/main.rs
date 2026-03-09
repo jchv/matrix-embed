@@ -4,35 +4,30 @@ use matrix_sdk::{
     Client, SessionMeta,
     authentication::{SessionTokens, matrix::MatrixSession},
     config::SyncSettings,
-    room::{Room, reply::Reply},
+    room::Room,
     ruma::events::room::{
         member::{MembershipState, StrippedRoomMemberEvent},
-        message::{
-            AddMentions, ForwardThread, MessageType, OriginalSyncRoomMessageEvent,
-            RoomMessageEventContent, TextMessageEventContent,
-        },
+        message::OriginalSyncRoomMessageEvent,
+        redaction::SyncRoomRedactionEvent,
     },
     store::RoomLoadSettings,
 };
-use metadata::Metadata;
 use mime_guess::Mime;
 use reqwest::Proxy;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::future::Future;
 use std::io::BufReader;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{debug, error, info, warn};
-use url::Url;
-
-use crate::processing::{MessageParams, process_metadata, process_response};
 
 mod command;
 mod config;
+mod extract;
+mod handler;
 mod media;
 mod metadata;
 mod processing;
+mod tracker;
 
 #[derive(Serialize, Deserialize)]
 struct SavedSession {
@@ -156,16 +151,22 @@ async fn main() -> Result<()> {
     let http_client = http_builder.build()?;
     let config = Arc::new(config);
 
-    // Event Handler
+    // Event tracker for replacement / redaction handling
+    let tracker = Arc::new(tracker::EventTracker::new());
+    tracker.spawn_cleanup_task();
+
+    // Message event handler
     client.add_event_handler({
         let config = config.clone();
         let http_client = http_client.clone();
         let client = client.clone();
+        let tracker = tracker.clone();
 
         move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let config = config.clone();
             let http_client = http_client.clone();
             let client = client.clone();
+            let tracker = tracker.clone();
             debug!("Event: {:?}", event);
             async move {
                 // Ignore own messages
@@ -173,14 +174,30 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                if let Err(e) = handle_message(event, room, config, http_client, client).await {
+                if let Err(e) =
+                    handler::handle_message(event, room, config, http_client, client, tracker).await
+                {
                     error!("Error handling message: {:?}", e);
                 }
             }
         }
     });
 
-    // Handle invites
+    // Redaction event handler
+    client.add_event_handler({
+        let tracker = tracker.clone();
+
+        move |event: SyncRoomRedactionEvent, room: Room| {
+            let tracker = tracker.clone();
+            async move {
+                if let Err(e) = handler::handle_redaction(event, room, tracker).await {
+                    error!("Error handling redaction: {:?}", e);
+                }
+            }
+        }
+    });
+
+    // Invite event handler
     client.add_event_handler({
         let config = config.clone();
         move |event: StrippedRoomMemberEvent, room: Room| {
@@ -227,194 +244,6 @@ async fn main() -> Result<()> {
 
     info!("Bot started, syncing...");
     client.sync(SyncSettings::default()).await?;
-
-    Ok(())
-}
-
-async fn handle_message(
-    event: OriginalSyncRoomMessageEvent,
-    room: Room,
-    config: Arc<Config>,
-    http_client: reqwest::Client,
-    client: Client,
-) -> Result<()> {
-    let msgtype = match event.content.msgtype.clone() {
-        MessageType::Text(t) => t,
-        _ => return Ok(()),
-    };
-
-    let body = msgtype.body;
-
-    // Check for bot commands before URL processing
-    match command::handle_command(&body, event.sender.as_str(), &config, &client).await {
-        command::CommandResult::Response(response) => {
-            // TODO: use text_markdown? Requires SDK feature that is disabled.
-            room.send(RoomMessageEventContent::text_plain(response).make_reply_to(
-                &event,
-                ForwardThread::Yes,
-                AddMentions::No,
-            ))
-            .await?;
-            return Ok(());
-        }
-        command::CommandResult::NotACommand => {}
-    }
-
-    for word in body.split_whitespace() {
-        if (word.starts_with("http://") || word.starts_with("https://"))
-            && let Ok(url) = Url::parse(word)
-        {
-            if config.is_url_ignored(&url) {
-                debug!("Ignoring URL (matched ignored pattern): {}", url);
-                continue;
-            }
-
-            // Apply URL rewrites
-            let url = config.rewrite_url(&url);
-            debug!("Found URL: {}", url);
-            if let Err(e) = process_url(&http_client, &room, &config, &url, event.clone()).await {
-                warn!("Failed to process URL {}: {:?}", url, e);
-            }
-            // Only process the first URL found (for now?)
-            break;
-        }
-    }
-
-    Ok(())
-}
-
-async fn process_url(
-    http_client: &reqwest::Client,
-    room: &Room,
-    config: &Config,
-    url: &Url,
-    reply: OriginalSyncRoomMessageEvent,
-) -> Result<()> {
-    match Metadata::fetch_from_url(http_client, url).await {
-        Ok(meta) => {
-            debug!("Metadata: {:?}", meta);
-            if meta.is_empty() {
-                return Ok(());
-            }
-            let params = process_metadata(meta, config);
-            post_message(http_client, room, config, params, reply, url).await?;
-        }
-        Err(e) => {
-            warn!("Failed to fetch metadata for {}: {:?}", url, e);
-        }
-    }
-    Ok(())
-}
-
-async fn with_typing<F, T>(room: &Room, fut: F) -> T
-where
-    F: Future<Output = T>,
-{
-    let typing_room = room.clone();
-    let typing_task = tokio::spawn(async move {
-        loop {
-            let _ = typing_room.typing_notice(true).await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    });
-
-    let result = fut.await;
-
-    typing_task.abort();
-    let _ = room.typing_notice(false).await;
-
-    result
-}
-
-async fn post_message(
-    http_client: &reqwest::Client,
-    room: &Room,
-    config: &Config,
-    params: MessageParams,
-    reply: OriginalSyncRoomMessageEvent,
-    referer: &Url,
-) -> Result<()> {
-    let has_text = !params.body.is_empty() || !params.html_body.is_empty();
-
-    let caption = if has_text {
-        Some(TextMessageEventContent::html(
-            params.body.clone(),
-            params.html_body.clone(),
-        ))
-    } else {
-        None
-    };
-
-    if let Some(media_url) = params.media_url {
-        info!("Downloading media from {}", media_url);
-
-        let result = with_typing(
-            room,
-            download_and_upload(
-                http_client,
-                room,
-                &media_url,
-                config,
-                caption,
-                Some(referer),
-                Reply {
-                    event_id: reply.event_id.clone(),
-                    enforce_thread: matrix_sdk::room::reply::EnforceThread::MaybeThreaded,
-                },
-            ),
-        )
-        .await;
-
-        if let Err(e) = result {
-            error!("Failed to upload media: {:?}", e);
-            // Fallback: Reply with text embed if failed
-            if has_text {
-                room.send(
-                    RoomMessageEventContent::text_html(params.body, params.html_body)
-                        .make_reply_to(&reply, ForwardThread::Yes, AddMentions::No),
-                )
-                .await?;
-            }
-        }
-    } else if has_text {
-        // Just text embed if no media
-        room.send(
-            RoomMessageEventContent::text_html(params.body, params.html_body).make_reply_to(
-                &reply,
-                ForwardThread::Yes,
-                AddMentions::No,
-            ),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-pub async fn download_and_upload(
-    client: &reqwest::Client,
-    room: &Room,
-    url: &Url,
-    config: &Config,
-    text: Option<TextMessageEventContent>,
-    referer: Option<&Url>,
-    reply: Reply,
-) -> Result<()> {
-    let mut request = client.get(url.clone()).timeout(config.download_timeout);
-    if let Some(referer) = referer {
-        request = request.header(reqwest::header::REFERER, referer.as_str());
-    }
-    let response = request.send().await.context("Failed to start download")?;
-
-    let attachment = process_response(response, config, text).await?;
-
-    // Generic file upload handles images/videos based on MIME type usually
-    room.send_attachment(
-        &attachment.filename,
-        &attachment.mime_type,
-        attachment.data,
-        attachment.attachment_config.reply(Some(reply)),
-    )
-    .await?;
 
     Ok(())
 }

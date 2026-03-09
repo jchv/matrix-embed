@@ -31,6 +31,10 @@ fn default_url_rewrites() -> Vec<(regex::Regex, String)> {
             Regex::new(r"^https?://(www\.)?pixiv\.net/").unwrap(),
             "https://phixiv.net/".to_string(),
         ),
+        (
+            Regex::new(r"^https?://(www\.)?instagram\.com/").unwrap(),
+            "https://www.kkinstagram.com/".to_string(),
+        ),
     ]
 }
 
@@ -46,10 +50,6 @@ pub struct Args {
     /// Path to a file containing the password
     #[arg(long)]
     pub password_file: Option<PathBuf>,
-
-    /// Path to a file containing the recovery passphrase
-    #[arg(long)]
-    pub recovery_passphrase_file: Option<PathBuf>,
 
     /// Path to a file containing an access token
     #[arg(long)]
@@ -109,12 +109,11 @@ struct RewriteConfig {
     replacement: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Config {
     pub homeserver_url: Url,
     pub username: String,
     pub password: Option<String>,
-    pub recovery_passphrase: Option<String>,
     pub access_token: Option<String>,
     pub state_store_path: PathBuf,
     pub max_file_size: u64,
@@ -139,20 +138,6 @@ impl Config {
                 tokio::fs::read_to_string(&path)
                     .await
                     .with_context(|| format!("Failed to read password file: {:?}", path))?
-                    .trim()
-                    .to_string(),
-            )
-        } else {
-            None
-        };
-
-        let recovery_passphrase = if let Some(path) = args.recovery_passphrase_file {
-            Some(
-                tokio::fs::read_to_string(&path)
-                    .await
-                    .with_context(|| {
-                        format!("Failed to read recovery passphrase file: {:?}", path)
-                    })?
                     .trim()
                     .to_string(),
             )
@@ -229,7 +214,6 @@ impl Config {
             homeserver_url: args.homeserver_url,
             username: args.username.unwrap_or_default(),
             password,
-            recovery_passphrase,
             access_token,
             state_store_path: args.state_store_path,
             max_file_size: args.max_file_size,
@@ -273,7 +257,6 @@ impl Default for Config {
             homeserver_url: Url::parse(DEFAULT_HOMESERVER_URL).unwrap(),
             username: "".to_string(),
             password: None,
-            recovery_passphrase: None,
             access_token: None,
             state_store_path: PathBuf::from(DEFAULT_STATE_STORE_PATH),
             max_file_size: DEFAULT_MAX_FILE_SIZE,
