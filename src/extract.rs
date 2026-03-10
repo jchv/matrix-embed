@@ -10,6 +10,10 @@ use url::Url;
 static QUOTED_LINKS: LazyLock<Selector> =
     LazyLock::new(|| Selector::parse("mx-reply a[href]").unwrap());
 
+/// Used to find the <mx-reply> element itself so we can scan its text nodes
+/// for plain-text URLs (i.e. URLs not wrapped in an <a> tag).
+static QUOTED_REPLY: LazyLock<Selector> = LazyLock::new(|| Selector::parse("mx-reply").unwrap());
+
 /// Extract URLs from the quoted message of a formatted body.
 ///
 /// Some Matrix clients embed a quoted message in the <mx-reply> in the body of
@@ -27,11 +31,29 @@ static QUOTED_LINKS: LazyLock<Selector> =
 ///
 /// So far this seems to only impact Fluffychat, but there might be others.
 fn extract_quoted_urls(formatted_body: &str) -> HashSet<Url> {
-    Html::parse_fragment(formatted_body)
+    let doc = Html::parse_fragment(formatted_body);
+
+    // Collect URLs from <a href> tags within mx-reply.
+    let mut urls: HashSet<Url> = doc
         .select(&QUOTED_LINKS)
         .filter_map(|el| el.value().attr("href"))
         .filter_map(|href| Url::parse(href).ok())
-        .collect()
+        .collect();
+
+    // Collect verbatim URLs as well.
+    for reply_el in doc.select(&QUOTED_REPLY) {
+        for text in reply_el.text() {
+            for word in text.split_whitespace() {
+                if (word.starts_with("http://") || word.starts_with("https://"))
+                    && let Ok(url) = Url::parse(word)
+                {
+                    urls.insert(url);
+                }
+            }
+        }
+    }
+
+    urls
 }
 
 /// Extract a suitable URL to embed from the message. For now, this only ever
@@ -127,6 +149,29 @@ mod tests {
         let html = r#"<mx-reply><blockquote>Just plain text</blockquote></mx-reply>"#;
         let urls = extract_quoted_urls(html);
         assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn test_extract_quoted_urls_plain_text_url_no_anchor() {
+        let html = r#"<mx-reply><blockquote><a href="https://matrix.to/#/!room/$event">In reply to</a> <a href="https://matrix.to/#/@user:matrix.org">@user:matrix.org</a><br>https:&#47;&#47;x.com&#47;user&#47;status&#47;1234567890123456789</blockquote></mx-reply>Reply"#;
+        let urls = extract_quoted_urls(html);
+        assert!(
+            urls.contains(&Url::parse("https://x.com/user/status/1234567890123456789").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_extract_url_ignore_quoted_plain_text_url() {
+        assert_eq!(
+            extract_url(
+                &TextMessageEventContent::html(
+                    "> <@user:matrix.org> https://x.com/user/status/1234567890123456789\n\nReply",
+                    r#"<mx-reply><blockquote><a href="https://matrix.to/#/!room/$event">In reply to</a> <a href="https://matrix.to/#/@user:matrix.org">@user:matrix.org</a><br>https:&#47;&#47;x.com&#47;user&#47;status&#47;1234567890123456789</blockquote></mx-reply>Reply"#
+                ),
+                &Default::default(),
+            ),
+            None
+        );
     }
 
     #[test]
