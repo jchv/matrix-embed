@@ -83,6 +83,11 @@ struct ActivityPubObject {
     /// Present when the top-level object is an Activity (e.g. `Create`)
     /// wrapping the actual post.
     object: Option<Box<ActivityPubObject>>,
+
+    /// The author of the post — usually a URL string pointing at an Actor,
+    /// but can also be an inline Actor object or an array.
+    #[serde(rename = "attributedTo")]
+    attributed_to: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -97,6 +102,18 @@ struct ActivityPubAttachment {
     /// Alt-text (unused for now, but deserialized so serde doesn't choke).
     #[allow(dead_code)]
     name: Option<String>,
+}
+
+/// Minimal representation of an ActivityPub Actor (`Person`, `Service`, …),
+/// used to resolve display name and username for the embed title.
+#[derive(Deserialize, Debug, Default)]
+struct ActivityPubActor {
+    /// Human-readable display name (e.g. "あるるも").
+    name: Option<String>,
+
+    /// Local username without the leading `@` (e.g. "arurumo").
+    #[serde(rename = "preferredUsername")]
+    preferred_username: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +267,67 @@ impl ActivityPubDetector {
             }
         };
 
-        ap_object_to_metadata(&obj)
+        // Peek at the note so we can resolve the author before building
+        // metadata.  If extraction fails here it will also fail inside
+        // ap_object_to_metadata, so returning None is fine.
+        let note = extract_note(&obj)?;
+
+        let author_title = self.resolve_author(client, note).await;
+
+        ap_object_to_metadata(&obj, author_title.as_deref())
+    }
+
+    /// Try to build an author title string like
+    /// `"DisplayName (@username@host)"` from the note's `attributedTo` field.
+    async fn resolve_author(
+        &self,
+        client: &reqwest::Client,
+        note: &ActivityPubObject,
+    ) -> Option<String> {
+        let attributed_to = note.attributed_to.as_ref()?;
+        let actor_url = extract_attributed_to_url(attributed_to)?;
+
+        let actor = self.fetch_actor(client, &actor_url).await;
+        let host = Url::parse(&actor_url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()));
+
+        format_author_title(&actor, host.as_deref())
+    }
+
+    /// Fetch an ActivityPub Actor object by URL.
+    async fn fetch_actor(&self, client: &reqwest::Client, actor_url: &str) -> ActivityPubActor {
+        let response = match client
+            .get(actor_url)
+            .timeout(FETCH_TIMEOUT)
+            .header(ACCEPT, AP_CONTENT_TYPE)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                debug!("Actor fetch returned {} for {}", r.status(), actor_url);
+                return ActivityPubActor::default();
+            }
+            Err(e) => {
+                debug!("Actor fetch failed for {}: {}", actor_url, e);
+                return ActivityPubActor::default();
+            }
+        };
+
+        match response.json::<ActivityPubActor>().await {
+            Ok(actor) => {
+                debug!(
+                    "Resolved actor {}: name={:?}, preferredUsername={:?}",
+                    actor_url, actor.name, actor.preferred_username
+                );
+                actor
+            }
+            Err(e) => {
+                debug!("Failed to parse actor JSON from {}: {}", actor_url, e);
+                ActivityPubActor::default()
+            }
+        }
     }
 }
 
@@ -258,13 +335,11 @@ impl ActivityPubDetector {
 // Conversion helpers
 // ---------------------------------------------------------------------------
 
-/// Turn an [`ActivityPubObject`] into [`Metadata`], handling both bare `Note`
-/// objects and `Create` / `Announce` activities that wrap one.
-fn ap_object_to_metadata(obj: &ActivityPubObject) -> Option<Metadata> {
+/// Unwrap an [`ActivityPubObject`] to reach the inner post-like object,
+/// handling both bare Notes and wrapping Activities (`Create`, `Announce`).
+fn extract_note(obj: &ActivityPubObject) -> Option<&ActivityPubObject> {
     let note = match obj.object_type.as_deref() {
-        // Activities that wrap the real object.
         Some("Create") | Some("Announce") => obj.object.as_deref()?,
-        // Post-like types we understand.
         Some("Note") | Some("Article") | Some("Question") | Some("Page") => obj,
         Some(other) => {
             debug!("Ignoring ActivityPub object of type '{}'", other);
@@ -273,18 +348,79 @@ fn ap_object_to_metadata(obj: &ActivityPubObject) -> Option<Metadata> {
         None => return None,
     };
 
-    // After unwrapping, the inner object must still be post-like.
     match note.object_type.as_deref() {
-        Some("Note") | Some("Article") | Some("Question") | Some("Page") => {}
-        _ => return None,
+        Some("Note") | Some("Article") | Some("Question") | Some("Page") => Some(note),
+        _ => None,
     }
+}
 
-    let title = note.summary.clone().filter(|s| !s.is_empty());
-    let description = note
-        .content
+/// Extract an actor URL from an `attributedTo` value, which can be a plain
+/// URL string, an object with an `id` field, or an array of either.
+fn extract_attributed_to_url(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(obj) => obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        serde_json::Value::Array(arr) => arr.first().and_then(extract_attributed_to_url),
+        _ => None,
+    }
+}
+
+/// Format an author title string like `"DisplayName (@username@host)"` from
+/// actor profile fields, matching the format typically used by OpenGraph
+/// metadata on Fediverse instances.
+fn format_author_title(actor: &ActivityPubActor, host: Option<&str>) -> Option<String> {
+    let name = actor.name.as_deref().filter(|s| !s.is_empty());
+    let username = actor
+        .preferred_username
         .as_deref()
-        .map(strip_html)
         .filter(|s| !s.is_empty());
+
+    match (name, username, host) {
+        (Some(name), Some(user), Some(host)) => Some(format!("{} (@{}@{})", name, user, host)),
+        (Some(name), Some(user), None) => Some(format!("{} (@{})", name, user)),
+        (Some(name), None, _) => Some(name.to_string()),
+        (None, Some(user), Some(host)) => Some(format!("@{}@{}", user, host)),
+        (None, Some(user), None) => Some(format!("@{}", user)),
+        (None, None, _) => None,
+    }
+}
+
+/// Turn an [`ActivityPubObject`] into [`Metadata`], handling both bare `Note`
+/// objects and `Create` / `Announce` activities that wrap one.
+///
+/// When `author_title` is provided it is used as the metadata title (matching
+/// the usual OpenGraph behaviour) and any content-warning / summary text is
+/// folded into the description.  When `author_title` is `None` the summary is
+/// used as the title instead (fallback).
+fn ap_object_to_metadata(obj: &ActivityPubObject, author_title: Option<&str>) -> Option<Metadata> {
+    let note = extract_note(obj)?;
+
+    let cw = note.summary.as_deref().filter(|s| !s.is_empty());
+    let content = note.content.as_deref().map(strip_html);
+    let content = content.as_deref().filter(|s| !s.is_empty());
+
+    // When we have author information use it as the title (matching the
+    // format OG tags normally provide, e.g. "あるるも (@arurumo@misskey.io)").
+    // The CW, if present, is prepended to the description.
+    // When author resolution failed, fall back to the CW as the title.
+    let title;
+    let description;
+
+    if let Some(author) = author_title {
+        title = Some(author.to_string());
+        description = match (cw, content) {
+            (Some(cw), Some(text)) => Some(format!("{}\n{}", cw, text)),
+            (Some(cw), None) => Some(cw.to_string()),
+            (None, Some(text)) => Some(text.to_string()),
+            (None, None) => None,
+        };
+    } else {
+        title = cw.map(|s| s.to_string());
+        description = content.map(|s| s.to_string());
+    }
 
     let mut image_url: Option<Url> = None;
     let mut video_url: Option<Url> = None;
@@ -539,9 +675,10 @@ mod tests {
                 name: Some("Alt text".into()),
             }]),
             object: None,
+            attributed_to: None,
         };
 
-        let meta = ap_object_to_metadata(&obj).unwrap();
+        let meta = ap_object_to_metadata(&obj, None).unwrap();
         assert_eq!(meta.title.as_deref(), Some("CW: spoilers"));
         assert_eq!(meta.description.as_deref(), Some("Here is the post"));
         assert_eq!(
@@ -573,10 +710,12 @@ mod tests {
                     name: None,
                 }]),
                 object: None,
+                attributed_to: None,
             })),
+            attributed_to: None,
         };
 
-        let meta = ap_object_to_metadata(&obj).unwrap();
+        let meta = ap_object_to_metadata(&obj, None).unwrap();
         assert!(meta.title.is_none());
         assert_eq!(meta.description.as_deref(), Some("Inner note"));
         assert_eq!(
@@ -594,9 +733,10 @@ mod tests {
             sensitive: None,
             attachment: None,
             object: None,
+            attributed_to: None,
         };
 
-        let meta = ap_object_to_metadata(&obj).unwrap();
+        let meta = ap_object_to_metadata(&obj, None).unwrap();
         assert!(meta.title.is_none());
         assert_eq!(meta.description.as_deref(), Some("Just text, no CW"));
     }
@@ -610,9 +750,10 @@ mod tests {
             sensitive: None,
             attachment: None,
             object: None,
+            attributed_to: None,
         };
 
-        let meta = ap_object_to_metadata(&obj).unwrap();
+        let meta = ap_object_to_metadata(&obj, None).unwrap();
         assert!(meta.title.is_none());
     }
 
@@ -625,9 +766,10 @@ mod tests {
             sensitive: None,
             attachment: None,
             object: None,
+            attributed_to: None,
         };
 
-        assert!(ap_object_to_metadata(&obj).is_none());
+        assert!(ap_object_to_metadata(&obj, None).is_none());
     }
 
     #[test]
@@ -639,9 +781,10 @@ mod tests {
             sensitive: None,
             attachment: None,
             object: None,
+            attributed_to: None,
         };
 
-        assert!(ap_object_to_metadata(&obj).is_none());
+        assert!(ap_object_to_metadata(&obj, None).is_none());
     }
 
     #[test]
@@ -653,9 +796,10 @@ mod tests {
             sensitive: None,
             attachment: None,
             object: None,
+            attributed_to: None,
         };
 
-        assert!(ap_object_to_metadata(&obj).is_none());
+        assert!(ap_object_to_metadata(&obj, None).is_none());
     }
 
     #[test]
@@ -696,9 +840,10 @@ mod tests {
                 },
             ]),
             object: None,
+            attributed_to: None,
         };
 
-        let meta = ap_object_to_metadata(&obj).unwrap();
+        let meta = ap_object_to_metadata(&obj, None).unwrap();
         // First of each type wins.
         assert_eq!(
             meta.image_url,
@@ -736,9 +881,10 @@ mod tests {
                 },
             ]),
             object: None,
+            attributed_to: None,
         };
 
-        let meta = ap_object_to_metadata(&obj).unwrap();
+        let meta = ap_object_to_metadata(&obj, None).unwrap();
         assert_eq!(
             meta.image_url,
             Some(Url::parse("https://cdn.example.com/good.jpg").unwrap())
@@ -754,9 +900,10 @@ mod tests {
             sensitive: None,
             attachment: None,
             object: None,
+            attributed_to: None,
         };
 
-        let meta = ap_object_to_metadata(&obj).unwrap();
+        let meta = ap_object_to_metadata(&obj, None).unwrap();
         assert_eq!(meta.title.as_deref(), Some("My Blog Post"));
         assert_eq!(meta.description.as_deref(), Some("Long form content here."));
     }
@@ -776,9 +923,10 @@ mod tests {
                 name: None,
             }]),
             object: None,
+            attributed_to: None,
         };
 
-        let meta = ap_object_to_metadata(&obj).unwrap();
+        let meta = ap_object_to_metadata(&obj, None).unwrap();
         // Unknown media type doesn't match image/video/audio, so no media URL.
         assert!(meta.image_url.is_none());
         assert!(meta.video_url.is_none());
@@ -815,7 +963,7 @@ mod tests {
         });
 
         let obj: ActivityPubObject = serde_json::from_value(json).unwrap();
-        let meta = ap_object_to_metadata(&obj).unwrap();
+        let meta = ap_object_to_metadata(&obj, None).unwrap();
 
         assert!(meta.title.is_none()); // summary was null
         assert_eq!(
@@ -849,10 +997,280 @@ mod tests {
         });
 
         let obj: ActivityPubObject = serde_json::from_value(json).unwrap();
-        let meta = ap_object_to_metadata(&obj).unwrap();
+        let meta = ap_object_to_metadata(&obj, None).unwrap();
 
         assert_eq!(meta.title.as_deref(), Some("CW: NSFW"));
         assert_eq!(meta.description.as_deref(), Some("sensitive art post"));
+        assert_eq!(
+            meta.image_url,
+            Some(Url::parse("https://media.misskeycdn.com/abc.webp").unwrap())
+        );
+    }
+
+    // -- format_author_title ------------------------------------------------
+
+    #[test]
+    fn test_format_author_title_full() {
+        let actor = ActivityPubActor {
+            name: Some("あるるも".into()),
+            preferred_username: Some("arurumo".into()),
+        };
+        assert_eq!(
+            format_author_title(&actor, Some("misskey.io")),
+            Some("あるるも (@arurumo@misskey.io)".into())
+        );
+    }
+
+    #[test]
+    fn test_format_author_title_no_host() {
+        let actor = ActivityPubActor {
+            name: Some("Alice".into()),
+            preferred_username: Some("alice".into()),
+        };
+        assert_eq!(
+            format_author_title(&actor, None),
+            Some("Alice (@alice)".into())
+        );
+    }
+
+    #[test]
+    fn test_format_author_title_name_only() {
+        let actor = ActivityPubActor {
+            name: Some("Alice".into()),
+            preferred_username: None,
+        };
+        assert_eq!(
+            format_author_title(&actor, Some("example.com")),
+            Some("Alice".into())
+        );
+    }
+
+    #[test]
+    fn test_format_author_title_username_only() {
+        let actor = ActivityPubActor {
+            name: None,
+            preferred_username: Some("alice".into()),
+        };
+        assert_eq!(
+            format_author_title(&actor, Some("example.com")),
+            Some("@alice@example.com".into())
+        );
+    }
+
+    #[test]
+    fn test_format_author_title_username_no_host() {
+        let actor = ActivityPubActor {
+            name: None,
+            preferred_username: Some("alice".into()),
+        };
+        assert_eq!(format_author_title(&actor, None), Some("@alice".into()));
+    }
+
+    #[test]
+    fn test_format_author_title_empty() {
+        let actor = ActivityPubActor {
+            name: None,
+            preferred_username: None,
+        };
+        assert_eq!(format_author_title(&actor, Some("example.com")), None);
+    }
+
+    #[test]
+    fn test_format_author_title_blank_name_falls_back() {
+        let actor = ActivityPubActor {
+            name: Some("".into()),
+            preferred_username: Some("alice".into()),
+        };
+        assert_eq!(
+            format_author_title(&actor, Some("example.com")),
+            Some("@alice@example.com".into())
+        );
+    }
+
+    // -- extract_attributed_to_url ------------------------------------------
+
+    #[test]
+    fn test_extract_attributed_to_url_string() {
+        let val = serde_json::json!("https://mastodon.social/users/alice");
+        assert_eq!(
+            extract_attributed_to_url(&val),
+            Some("https://mastodon.social/users/alice".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_attributed_to_url_object() {
+        let val = serde_json::json!({
+            "type": "Person",
+            "id": "https://mastodon.social/users/alice",
+            "name": "Alice"
+        });
+        assert_eq!(
+            extract_attributed_to_url(&val),
+            Some("https://mastodon.social/users/alice".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_attributed_to_url_array() {
+        let val = serde_json::json!([
+            "https://mastodon.social/users/alice",
+            "https://example.com/bob"
+        ]);
+        assert_eq!(
+            extract_attributed_to_url(&val),
+            Some("https://mastodon.social/users/alice".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_attributed_to_url_null() {
+        assert_eq!(extract_attributed_to_url(&serde_json::Value::Null), None);
+    }
+
+    // -- author-aware metadata conversion -----------------------------------
+
+    #[test]
+    fn test_note_with_author_and_cw() {
+        let obj = ActivityPubObject {
+            object_type: Some("Note".into()),
+            summary: Some("CW: spoilers".into()),
+            content: Some("<p>The actual post</p>".into()),
+            sensitive: Some(true),
+            attachment: Some(vec![ActivityPubAttachment {
+                media_type: Some("image/jpeg".into()),
+                url: Some(serde_json::Value::String(
+                    "https://files.example.com/photo.jpg".into(),
+                )),
+                name: None,
+            }]),
+            object: None,
+            attributed_to: None,
+        };
+
+        let meta = ap_object_to_metadata(&obj, Some("Alice (@alice@example.com)")).unwrap();
+        // Author becomes the title.
+        assert_eq!(meta.title.as_deref(), Some("Alice (@alice@example.com)"));
+        // CW is folded into the description before the content.
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("CW: spoilers\nThe actual post")
+        );
+        assert_eq!(
+            meta.image_url,
+            Some(Url::parse("https://files.example.com/photo.jpg").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_note_with_author_no_cw() {
+        let obj = ActivityPubObject {
+            object_type: Some("Note".into()),
+            summary: None,
+            content: Some("<p>Just a normal post</p>".into()),
+            sensitive: None,
+            attachment: None,
+            object: None,
+            attributed_to: None,
+        };
+
+        let meta = ap_object_to_metadata(&obj, Some("Bob (@bob@example.com)")).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Bob (@bob@example.com)"));
+        assert_eq!(meta.description.as_deref(), Some("Just a normal post"));
+    }
+
+    #[test]
+    fn test_note_with_author_cw_only() {
+        let obj = ActivityPubObject {
+            object_type: Some("Note".into()),
+            summary: Some("CW: secret".into()),
+            content: None,
+            sensitive: Some(true),
+            attachment: None,
+            object: None,
+            attributed_to: None,
+        };
+
+        let meta = ap_object_to_metadata(&obj, Some("Carol (@carol@example.com)")).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Carol (@carol@example.com)"));
+        // CW is the only text, so it becomes the description.
+        assert_eq!(meta.description.as_deref(), Some("CW: secret"));
+    }
+
+    #[test]
+    fn test_mastodon_style_note_with_author() {
+        let json = serde_json::json!({
+            "@context": [
+                "https://www.w3.org/ns/activitystreams",
+                "https://w3id.org/security/v1"
+            ],
+            "id": "https://mastodon.social/users/alice/statuses/123",
+            "type": "Note",
+            "summary": null,
+            "content": "<p>Look at this cool photo!</p>",
+            "sensitive": true,
+            "attachment": [
+                {
+                    "type": "Document",
+                    "mediaType": "image/webp",
+                    "url": "https://files.mastodon.social/media/original/abc123.webp",
+                    "name": "A cool photo",
+                    "blurhash": "LEHV6nWB2y"
+                }
+            ],
+            "attributedTo": "https://mastodon.social/users/alice",
+            "published": "2025-01-15T12:00:00Z"
+        });
+
+        let obj: ActivityPubObject = serde_json::from_value(json).unwrap();
+        let meta = ap_object_to_metadata(&obj, Some("Alice (@alice@mastodon.social)")).unwrap();
+
+        assert_eq!(
+            meta.title.as_deref(),
+            Some("Alice (@alice@mastodon.social)")
+        );
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("Look at this cool photo!")
+        );
+        assert_eq!(
+            meta.image_url,
+            Some(Url::parse("https://files.mastodon.social/media/original/abc123.webp").unwrap())
+        );
+    }
+
+    #[test]
+    fn test_misskey_style_note_with_author() {
+        let json = serde_json::json!({
+            "@context": "https://www.w3.org/ns/activitystreams",
+            "id": "https://misskey.io/notes/abcdef",
+            "type": "Note",
+            "summary": "CW: NSFW",
+            "content": "<p><span>sensitive art post</span></p>",
+            "sensitive": true,
+            "attachment": [
+                {
+                    "type": "Document",
+                    "mediaType": "image/webp",
+                    "url": "https://media.misskeycdn.com/abc.webp",
+                    "name": null,
+                    "sensitive": true
+                }
+            ]
+        });
+
+        let obj: ActivityPubObject = serde_json::from_value(json).unwrap();
+        let meta = ap_object_to_metadata(&obj, Some("あるるも (@arurumo@misskey.io)")).unwrap();
+
+        assert_eq!(
+            meta.title.as_deref(),
+            Some("あるるも (@arurumo@misskey.io)")
+        );
+        // CW is folded into the description.
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("CW: NSFW\nsensitive art post")
+        );
         assert_eq!(
             meta.image_url,
             Some(Url::parse("https://media.misskeycdn.com/abc.webp").unwrap())
