@@ -20,6 +20,7 @@ use std::io::BufReader;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+mod activitypub;
 mod command;
 mod config;
 mod extract;
@@ -155,18 +156,23 @@ async fn main() -> Result<()> {
     let tracker = Arc::new(tracker::EventTracker::new());
     tracker.spawn_cleanup_task();
 
+    // ActivityPub detector for Fediverse support
+    let ap_detector = Arc::new(activitypub::ActivityPubDetector::new());
+
     // Message event handler
     client.add_event_handler({
         let config = config.clone();
         let http_client = http_client.clone();
         let client = client.clone();
         let tracker = tracker.clone();
+        let ap_detector = ap_detector.clone();
 
         move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let config = config.clone();
             let http_client = http_client.clone();
             let client = client.clone();
             let tracker = tracker.clone();
+            let ap_detector = ap_detector.clone();
             debug!("Event: {:?}", event);
             async move {
                 // Ignore own messages
@@ -174,8 +180,16 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                if let Err(e) =
-                    handler::handle_message(event, room, config, http_client, client, tracker).await
+                if let Err(e) = handler::handle_message(
+                    event,
+                    room,
+                    config,
+                    http_client,
+                    client,
+                    tracker,
+                    ap_detector,
+                )
+                .await
                 {
                     error!("Error handling message: {:?}", e);
                 }

@@ -1,8 +1,10 @@
 use anyhow::{Result, bail};
 use scraper::{Html, Selector};
 use std::sync::LazyLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use url::Url;
+
+use crate::activitypub::ActivityPubDetector;
 
 // Match both property="og:..." and name="og:..." since some stuff uses name even though it is non-standard.
 static OPENGRAPH_SELECTOR: LazyLock<Selector> =
@@ -28,7 +30,17 @@ impl Metadata {
         self == &Metadata::default()
     }
 
-    pub async fn fetch_from_url(client: &reqwest::Client, url: &Url) -> Result<Metadata> {
+    pub async fn fetch_from_url(
+        client: &reqwest::Client,
+        url: &Url,
+        ap_detector: &ActivityPubDetector,
+    ) -> Result<Metadata> {
+        // Try ActivityPub first.
+        if let Some(meta) = ap_detector.fetch_metadata(client, url).await {
+            info!("Got metadata via ActivityPub for {}", url);
+            return Ok(meta);
+        }
+
         let content_type = match client.head(url.clone()).send().await {
             Ok(resp) => {
                 if let Err(e) = resp.error_for_status_ref() {

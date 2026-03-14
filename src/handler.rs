@@ -27,6 +27,7 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::{
+    activitypub::ActivityPubDetector,
     command,
     config::Config,
     extract::extract_url,
@@ -61,6 +62,7 @@ pub async fn handle_message(
     http_client: reqwest::Client,
     client: Client,
     tracker: Arc<EventTracker>,
+    ap_detector: Arc<ActivityPubDetector>,
 ) -> Result<()> {
     if let Some(Relation::Replacement(replacement)) = &event.content.relates_to {
         let original_event_id = replacement.event_id.clone();
@@ -72,6 +74,7 @@ pub async fn handle_message(
             config,
             http_client,
             tracker,
+            ap_detector,
         )
         .await;
     }
@@ -113,6 +116,7 @@ pub async fn handle_message(
         config,
         http_client,
         url,
+        ap_detector,
     )
     .await;
 
@@ -184,6 +188,7 @@ async fn handle_replacement(
     config: Arc<Config>,
     http_client: reqwest::Client,
     tracker: Arc<EventTracker>,
+    ap_detector: Arc<ActivityPubDetector>,
 ) -> Result<()> {
     let new_url = if let MessageType::Text(text) = new_msgtype {
         extract_url(text, &config)
@@ -230,6 +235,7 @@ async fn handle_replacement(
                 config,
                 http_client,
                 new_url,
+                ap_detector,
             )
             .await;
         }
@@ -254,11 +260,21 @@ async fn run_embed_task(
     config: Arc<Config>,
     http_client: reqwest::Client,
     url: Option<Url>,
+    ap_detector: Arc<ActivityPubDetector>,
 ) {
     match url {
         Some(url) => {
             debug!("Found URL: {}", url);
-            match process_and_post(&http_client, &room, &config, &url, reply_target).await {
+            match process_and_post(
+                &http_client,
+                &room,
+                &config,
+                &url,
+                reply_target,
+                &ap_detector,
+            )
+            .await
+            {
                 Ok(reply_event_id) => {
                     tracker
                         .register(original_event_id, Some(url.clone()), reply_event_id)
@@ -279,8 +295,9 @@ async fn process_and_post(
     config: &Config,
     url: &Url,
     reply_target: ReplyTarget,
+    ap_detector: &ActivityPubDetector,
 ) -> Result<Option<OwnedEventId>> {
-    let meta = Metadata::fetch_from_url(http_client, url).await?;
+    let meta = Metadata::fetch_from_url(http_client, url, ap_detector).await?;
 
     if meta.is_empty() {
         return Ok(None);
