@@ -28,6 +28,11 @@ fn default_url_rewrites() -> Vec<(regex::Regex, String)> {
             "https://vxtwitter.com/".to_string(),
         ),
         (
+            // fixupx/fxembed doesn't seem to work very well. Let's just rewrite it to vxtwitter too.
+            Regex::new(r"^https?://(www\.)?fixupx?\.com/").unwrap(),
+            "https://vxtwitter.com/".to_string(),
+        ),
+        (
             Regex::new(r"^https?://(www\.)?pixiv\.net/").unwrap(),
             "https://phixiv.net/".to_string(),
         ),
