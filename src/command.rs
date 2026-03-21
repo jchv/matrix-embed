@@ -38,7 +38,7 @@ pub async fn handle_command(
     // args[0] is "!embedbot"
     match args.get(1).copied() {
         None => CommandResult::Response(usage_root()),
-        Some("admin") => handle_admin(&args[2..], sender, config, client, database).await,
+        Some("admin") => handle_admin(room_id, &args[2..], sender, config, client, database).await,
         Some("export-keys") => handle_export_keys(room_id, client, database).await,
         Some(other) => {
             CommandResult::Response(format!("Unknown command `{}`. {}", other, usage_root()))
@@ -68,6 +68,7 @@ Available subcommands:\n\
 }
 
 async fn handle_admin(
+    room_id: &str,
     args: &[&str],
     sender: &str,
     config: &Config,
@@ -87,8 +88,12 @@ async fn handle_admin(
         Some("remove-device") => handle_remove_device(&args[1..], config, client).await,
         Some("remove-other-devices") => handle_remove_other_devices(config, client).await,
         Some("reset-identity") => handle_reset_identity(config, client).await,
-        Some("enable-key-sharing") => handle_enable_key_sharing(&args[1..], database).await,
-        Some("disable-key-sharing") => handle_disable_key_sharing(&args[1..], database).await,
+        Some("enable-key-sharing") => {
+            handle_enable_key_sharing(room_id, &args[1..], database).await
+        }
+        Some("disable-key-sharing") => {
+            handle_disable_key_sharing(room_id, &args[1..], database).await
+        }
         Some("list-key-sharing") => handle_list_key_sharing(database).await,
         Some(other) => CommandResult::Response(format!(
             "Unknown admin command `{}`. {}",
@@ -326,21 +331,13 @@ async fn handle_export_keys(
     }
 }
 
-async fn handle_enable_key_sharing(args: &[&str], database: &Arc<Database>) -> CommandResult {
-    let Some(room_id) = args.first().copied() else {
-        return CommandResult::Response(
-            "Usage: `!embedbot admin enable-key-sharing <room_id>`\n\n\
-             The room ID should look like `!abc123:example.com`."
-                .to_string(),
-        );
-    };
-
-    if !room_id.starts_with('!') || !room_id.contains(':') {
-        return CommandResult::Response(format!(
-            "`{}` does not look like a valid room ID. \
-             Room IDs start with `!` and contain a `:`, e.g. `!abc123:example.com`.",
-            room_id
-        ));
+async fn handle_enable_key_sharing(
+    mut room_id: &str,
+    args: &[&str],
+    database: &Arc<Database>,
+) -> CommandResult {
+    if let Some(room_id_arg) = args.first().copied() {
+        room_id = room_id_arg;
     }
 
     info!("Admin request to enable key sharing for room {}", room_id);
@@ -357,12 +354,14 @@ async fn handle_enable_key_sharing(args: &[&str], database: &Arc<Database>) -> C
     }
 }
 
-async fn handle_disable_key_sharing(args: &[&str], database: &Arc<Database>) -> CommandResult {
-    let Some(room_id) = args.first().copied() else {
-        return CommandResult::Response(
-            "Usage: `!embedbot admin disable-key-sharing <room_id>`".to_string(),
-        );
-    };
+async fn handle_disable_key_sharing(
+    mut room_id: &str,
+    args: &[&str],
+    database: &Arc<Database>,
+) -> CommandResult {
+    if let Some(room_id_arg) = args.first().copied() {
+        room_id = room_id_arg;
+    }
 
     info!("Admin request to disable key sharing for room {}", room_id);
 
