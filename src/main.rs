@@ -251,7 +251,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Account setup (avatar)
+    // Account setup (avatar, display name)
     info!("Configuring any relevant account settings if needed...");
 
     if let Some(avatar_data) = config.avatar_data.clone()
@@ -270,6 +270,23 @@ async fn main() -> Result<()> {
             .parse::<Mime>()?;
         client.account().upload_avatar(&kind, avatar_data).await?;
         info!("Avatar should be good to go now.");
+    }
+
+    if let Some(desired_name) = &config.display_name {
+        let current_name = client
+            .account()
+            .get_display_name()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if current_name.is_empty() || current_name != *desired_name {
+            info!("Setting display name to {:?}.", desired_name);
+            client
+                .account()
+                .set_display_name(Some(desired_name))
+                .await?;
+        }
     }
 
     // Sync loop

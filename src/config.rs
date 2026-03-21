@@ -89,6 +89,10 @@ pub struct Args {
     #[arg(long)]
     pub avatar_file: Option<PathBuf>,
 
+    /// Display name to set on the bot's profile
+    #[arg(long)]
+    pub display_name: Option<String>,
+
     /// Proxy to use when making external requests
     #[arg(long)]
     pub proxy: Option<Url>,
@@ -141,6 +145,7 @@ pub struct Config {
     pub max_embed_description_chars: usize,
     pub max_embed_description_lines: usize,
     pub avatar_data: Option<Vec<u8>>,
+    pub display_name: Option<String>,
     pub proxy: Option<Url>,
     pub reset_identity: bool,
     pub recovery_passphrase: Option<String>,
@@ -245,6 +250,7 @@ impl Config {
             max_embed_description_chars: args.max_embed_description_chars,
             max_embed_description_lines: args.max_embed_description_lines,
             avatar_data,
+            display_name: args.display_name,
             proxy: args.proxy,
             reset_identity: args.reset_identity,
             recovery_passphrase,
@@ -290,6 +296,7 @@ impl Default for Config {
             max_embed_description_chars: DEFAULT_MAX_EMBED_DESCRIPTION_CHARS,
             max_embed_description_lines: DEFAULT_MAX_EMBED_DESCRIPTION_LINES,
             avatar_data: None,
+            display_name: None,
             proxy: None,
             reset_identity: false,
             recovery_passphrase: None,
