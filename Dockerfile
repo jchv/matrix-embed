@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     libsqlite3-0 \
     && rm -rf /var/lib/apt/lists/*
-WORKDIR /app
+WORKDIR /data
 COPY --from=builder /app/target/release/matrix-embed /matrix-embed
 VOLUME ["/data"]
 ENTRYPOINT ["/matrix-embed"]

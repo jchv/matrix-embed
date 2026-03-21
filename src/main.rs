@@ -422,51 +422,6 @@ async fn login_fresh(config: &Config) -> Result<Client> {
     Ok(client)
 }
 
-/// Restore a session from a raw access token (legacy / non-encrypted path).
-async fn restore_from_access_token(config: &Config, token: &str) -> Result<Client> {
-    std::fs::create_dir_all(&config.state_store_path)?;
-
-    let client = Client::builder()
-        .homeserver_url(&config.homeserver_url)
-        .sqlite_store(&config.state_store_path, None)
-        .build()
-        .await
-        .context("Failed to build client")?;
-
-    let user_id = matrix_sdk::ruma::UserId::parse(&config.username)
-        .context("Failed to parse username as UserId for access-token restore")?;
-
-    let session = MatrixSession {
-        meta: SessionMeta {
-            user_id,
-            device_id: "MATRIX_EMBED_BOT".into(),
-        },
-        tokens: SessionTokens {
-            access_token: token.to_string(),
-            refresh_token: None,
-        },
-    };
-
-    client
-        .matrix_auth()
-        .restore_session(session, RoomLoadSettings::default())
-        .await
-        .context("Failed to restore session from access token")?;
-
-    // Validate
-    client
-        .whoami()
-        .await
-        .context("Access-token validation failed")?;
-
-    info!("Restored session from access token.");
-    Ok(client)
-}
-
-// ===========================================================================
-// Session persistence helpers
-// ===========================================================================
-
 /// Persist the current Matrix session to `session.json` atomically.
 async fn save_session(client: &Client, session_file: &Path) -> Result<()> {
     let session = client
