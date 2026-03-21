@@ -8,6 +8,7 @@ use url::Url;
 
 const DEFAULT_HOMESERVER_URL: &str = "https://matrix.org";
 const DEFAULT_STATE_STORE_PATH: &str = "state";
+const DEFAULT_DATABASE_PATH: &str = "matrix-embed.db";
 const DEFAULT_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_DOWNLOAD_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_EMBED_DESCRIPTION_CHARS: usize = 640;
@@ -56,10 +57,6 @@ pub struct Args {
     #[arg(long)]
     pub password_file: Option<PathBuf>,
 
-    /// Path to a file containing an access token
-    #[arg(long)]
-    pub access_token_file: Option<PathBuf>,
-
     #[arg(long, default_value = DEFAULT_STATE_STORE_PATH)]
     pub state_store_path: PathBuf,
 
@@ -79,6 +76,10 @@ pub struct Args {
     #[arg(long)]
     pub url_rewrites_file: Option<PathBuf>,
 
+    /// Path to the SQLite database for persistent bot state
+    #[arg(long, default_value = DEFAULT_DATABASE_PATH)]
+    pub database_path: PathBuf,
+
     /// Path to avatar to set, if none is set
     #[arg(long)]
     pub avatar_file: Option<PathBuf>,
@@ -90,6 +91,10 @@ pub struct Args {
     /// Reset identity
     #[arg(long)]
     pub reset_identity: bool,
+
+    /// Path to a file containing the recovery passphrase
+    #[arg(long)]
+    pub recovery_passphrase_file: Option<PathBuf>,
 
     /// Regular expressions for og:title values that should be ignored (can be specified multiple times)
     #[arg(long)]
@@ -119,8 +124,8 @@ pub struct Config {
     pub homeserver_url: Url,
     pub username: String,
     pub password: Option<String>,
-    pub access_token: Option<String>,
     pub state_store_path: PathBuf,
+    pub database_path: PathBuf,
     pub max_file_size: u64,
     pub download_timeout: Duration,
     pub trusted_users: Vec<String>,
@@ -132,6 +137,7 @@ pub struct Config {
     pub avatar_data: Option<Vec<u8>>,
     pub proxy: Option<Url>,
     pub reset_identity: bool,
+    pub recovery_passphrase: Option<String>,
 }
 
 impl Config {
@@ -143,18 +149,6 @@ impl Config {
                 tokio::fs::read_to_string(&path)
                     .await
                     .with_context(|| format!("Failed to read password file: {:?}", path))?
-                    .trim()
-                    .to_string(),
-            )
-        } else {
-            None
-        };
-
-        let access_token = if let Some(path) = args.access_token_file {
-            Some(
-                tokio::fs::read_to_string(&path)
-                    .await
-                    .with_context(|| format!("Failed to read access token file: {:?}", path))?
                     .trim()
                     .to_string(),
             )
@@ -205,6 +199,20 @@ impl Config {
                 .collect::<Result<Vec<_>>>()?
         };
 
+        let recovery_passphrase = if let Some(path) = args.recovery_passphrase_file {
+            Some(
+                tokio::fs::read_to_string(&path)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to read recovery passphrase file: {:?}", path)
+                    })?
+                    .trim()
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
         let avatar_data = if let Some(path) = args.avatar_file {
             Some(
                 tokio::fs::read(&path)
@@ -219,8 +227,8 @@ impl Config {
             homeserver_url: args.homeserver_url,
             username: args.username.unwrap_or_default(),
             password,
-            access_token,
             state_store_path: args.state_store_path,
+            database_path: args.database_path,
             max_file_size: args.max_file_size,
             download_timeout: Duration::from_secs(args.download_timeout_seconds),
             trusted_users: args.trusted_users,
@@ -232,6 +240,7 @@ impl Config {
             avatar_data,
             proxy: args.proxy,
             reset_identity: args.reset_identity,
+            recovery_passphrase,
         })
     }
 
@@ -262,8 +271,8 @@ impl Default for Config {
             homeserver_url: Url::parse(DEFAULT_HOMESERVER_URL).unwrap(),
             username: "".to_string(),
             password: None,
-            access_token: None,
             state_store_path: PathBuf::from(DEFAULT_STATE_STORE_PATH),
+            database_path: PathBuf::from(DEFAULT_DATABASE_PATH),
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             download_timeout: Duration::from_secs(DEFAULT_DOWNLOAD_TIMEOUT_SECONDS),
             trusted_users: vec![],
@@ -275,6 +284,7 @@ impl Default for Config {
             avatar_data: None,
             proxy: None,
             reset_identity: false,
+            recovery_passphrase: None,
         }
     }
 }

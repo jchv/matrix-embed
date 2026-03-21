@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use matrix_sdk::{
     Client,
+    attachment::AttachmentConfig,
     room::{
         Room,
         reply::{EnforceThread, Reply},
@@ -30,6 +31,7 @@ use crate::{
     activitypub::ActivityPubDetector,
     command,
     config::Config,
+    db::Database,
     extract::extract_url,
     metadata::Metadata,
     processing::{MessageParams, process_metadata, process_response},
@@ -63,6 +65,7 @@ pub async fn handle_message(
     client: Client,
     tracker: Arc<EventTracker>,
     ap_detector: Arc<ActivityPubDetector>,
+    database: Arc<Database>,
 ) -> Result<()> {
     if let Some(Relation::Replacement(replacement)) = &event.content.relates_to {
         let original_event_id = replacement.event_id.clone();
@@ -82,8 +85,10 @@ pub async fn handle_message(
     match command::handle_command(
         event.content.body(),
         event.sender.as_str(),
+        room.room_id().as_str(),
         &config,
         &client,
+        &database,
     )
     .await
     {
@@ -94,6 +99,35 @@ pub async fn handle_message(
                     ForwardThread::Yes,
                     AddMentions::No,
                 ),
+            )
+            .await?;
+            return Ok(());
+        }
+        command::CommandResult::KeyExport {
+            passphrase,
+            data,
+            key_count,
+        } => {
+            let caption_text = format!(
+                "Here are {} room key(s) for this room.\n\n\
+                 **Passphrase:** `{}`\n\n\
+                 Import this file in Element via *All Settings → Encryption → Import Keys*. You may need to exit and re-open Element to see old messages.",
+                key_count, passphrase,
+            );
+            let caption = TextMessageEventContent::markdown(caption_text);
+            let reply = Reply {
+                event_id: event.event_id.clone(),
+                enforce_thread: EnforceThread::MaybeThreaded,
+            };
+            let attach_config = AttachmentConfig::new()
+                .caption(Some(caption))
+                .reply(Some(reply));
+
+            room.send_attachment(
+                "room-keys.txt",
+                &"text/plain".parse().expect("valid mime"),
+                data,
+                attach_config,
             )
             .await?;
             return Ok(());
