@@ -25,6 +25,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 mod activitypub;
+mod cas;
 mod command;
 mod config;
 mod db;
@@ -89,6 +90,10 @@ async fn main() -> Result<()> {
     let database = db::Database::open(&config.database_path).await?;
     let database = Arc::new(database);
 
+    // Open (or create) the content-addressable media store.
+    let media_store = cas::MediaStore::open(&config.media_store_path).await?;
+    let media_store = Arc::new(media_store);
+
     let config = Arc::new(config);
 
     let tracker = Arc::new(tracker::EventTracker::new());
@@ -104,6 +109,7 @@ async fn main() -> Result<()> {
         let tracker = tracker.clone();
         let ap_detector = ap_detector.clone();
         let database = database.clone();
+        let media_store = media_store.clone();
 
         move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let config = config.clone();
@@ -112,6 +118,7 @@ async fn main() -> Result<()> {
             let tracker = tracker.clone();
             let ap_detector = ap_detector.clone();
             let database = database.clone();
+            let media_store = media_store.clone();
             debug!("Event: {:?}", event);
             async move {
                 // Ignore own messages.
@@ -127,6 +134,7 @@ async fn main() -> Result<()> {
                     tracker,
                     ap_detector,
                     database,
+                    media_store,
                 )
                 .await
                 {

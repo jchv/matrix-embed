@@ -1,14 +1,18 @@
 use std::sync::Arc;
 
+use crate::activitypub::ActivityPubDetector;
+use crate::cas::MediaStore;
 use crate::config::Config;
-use crate::db::Database;
+use crate::db::{CannedResponse, Database};
 use crate::key_sharing;
+use crate::metadata::Metadata;
 use anyhow::{Context, Result, bail};
 use matrix_sdk::Client;
 use matrix_sdk::encryption::CrossSigningResetAuthType;
 use matrix_sdk::ruma::api::client::uiaa;
 use matrix_sdk::ruma::{OwnedDeviceId, RoomId};
 use tracing::{error, info, warn};
+use url::Url;
 
 pub enum CommandResult {
     NotACommand,
@@ -18,6 +22,7 @@ pub enum CommandResult {
         data: Vec<u8>,
         key_count: usize,
     },
+    CannedResponse(CannedResponse),
 }
 
 pub async fn handle_command(
@@ -27,23 +32,49 @@ pub async fn handle_command(
     config: &Config,
     client: &Client,
     database: &Arc<Database>,
+    http_client: &reqwest::Client,
+    media_store: &MediaStore,
+    ap_detector: &ActivityPubDetector,
 ) -> CommandResult {
     let trimmed = body.trim();
-    if !trimmed.starts_with("!embedbot") {
-        return CommandResult::NotACommand;
+    if trimmed.starts_with("!embedbot") {
+        let args: Vec<&str> = trimmed.split_whitespace().collect();
+
+        return match args.get(1).copied() {
+            None => CommandResult::Response(usage_root()),
+            Some("admin") => {
+                handle_admin(
+                    room_id,
+                    &args[2..],
+                    sender,
+                    config,
+                    client,
+                    database,
+                    http_client,
+                    media_store,
+                    ap_detector,
+                )
+                .await
+            }
+            Some("export-keys") => handle_export_keys(room_id, client, database).await,
+            Some(other) => {
+                CommandResult::Response(format!("Unknown command `{}`. {}", other, usage_root()))
+            }
+        };
     }
 
-    let args: Vec<&str> = trimmed.split_whitespace().collect();
-
-    // args[0] is "!embedbot"
-    match args.get(1).copied() {
-        None => CommandResult::Response(usage_root()),
-        Some("admin") => handle_admin(room_id, &args[2..], sender, config, client, database).await,
-        Some("export-keys") => handle_export_keys(room_id, client, database).await,
-        Some(other) => {
-            CommandResult::Response(format!("Unknown command `{}`. {}", other, usage_root()))
+    // Check custom commands (message starts with !)
+    if trimmed.starts_with('!') {
+        if let Some(cmd_name) = trimmed.split_whitespace().next() {
+            match database.get_custom_command(room_id, cmd_name).await {
+                Ok(Some(response)) => return CommandResult::CannedResponse(response),
+                Ok(None) => {}
+                Err(e) => error!("Failed to look up custom command: {:?}", e),
+            }
         }
     }
+
+    CommandResult::NotACommand
 }
 
 fn usage_root() -> String {
@@ -63,7 +94,13 @@ Available subcommands:\n\
 - `reset-identity` — Reset cryptographic identity, set up recovery key and enable backups\n\
 - `enable-key-sharing` — Enable automatic room key distribution in this room\n\
 - `disable-key-sharing` — Disable automatic room key distribution in this room\n\
-- `list-key-sharing` — List all rooms with key sharing enabled"
+- `list-key-sharing` — List all rooms with key sharing enabled\n\
+- `add-command <name> [media_url] [text...]` — Add/update a custom command\n\
+- `remove-command <name>` — Remove a custom command\n\
+- `list-commands` — List custom commands for this room\n\
+- `add-autoresponder <pattern> [probability] [media_url] [text...]` — Add/update an autoresponder\n\
+- `remove-autoresponder <pattern>` — Remove an autoresponder\n\
+- `list-autoresponders` — List autoresponders for this room"
         .to_string()
 }
 
@@ -74,6 +111,9 @@ async fn handle_admin(
     config: &Config,
     client: &Client,
     database: &Arc<Database>,
+    http_client: &reqwest::Client,
+    media_store: &MediaStore,
+    ap_detector: &ActivityPubDetector,
 ) -> CommandResult {
     if !config.trusted_users.iter().any(|u| u == sender) {
         warn!("Untrusted user {} attempted to use admin command", sender);
@@ -95,6 +135,36 @@ async fn handle_admin(
             handle_disable_key_sharing(room_id, &args[1..], database).await
         }
         Some("list-key-sharing") => handle_list_key_sharing(database).await,
+        Some("add-command") => {
+            handle_add_command(
+                room_id,
+                &args[1..],
+                database,
+                http_client,
+                config,
+                media_store,
+                ap_detector,
+            )
+            .await
+        }
+        Some("remove-command") => handle_remove_command(room_id, &args[1..], database).await,
+        Some("list-commands") => handle_list_commands(room_id, database).await,
+        Some("add-autoresponder") => {
+            handle_add_autoresponder(
+                room_id,
+                &args[1..],
+                database,
+                http_client,
+                config,
+                media_store,
+                ap_detector,
+            )
+            .await
+        }
+        Some("remove-autoresponder") => {
+            handle_remove_autoresponder(room_id, &args[1..], database).await
+        }
+        Some("list-autoresponders") => handle_list_autoresponders(room_id, database).await,
         Some(other) => CommandResult::Response(format!(
             "Unknown admin command `{}`. {}",
             other,
@@ -401,6 +471,400 @@ async fn handle_list_key_sharing(database: &Arc<Database>) -> CommandResult {
     }
 }
 
+async fn fetch_and_store_media(
+    url_str: &str,
+    http_client: &reqwest::Client,
+    config: &Config,
+    media_store: &MediaStore,
+    ap_detector: &ActivityPubDetector,
+) -> Result<(String, String, String)> {
+    let url = Url::parse(url_str).context("Invalid URL")?;
+    let meta = Metadata::fetch_from_url(http_client, &url, ap_detector).await?;
+    let media_url = meta
+        .video_url
+        .or(meta.audio_url)
+        .or(meta.image_url)
+        .unwrap_or_else(|| url.clone());
+
+    let response = http_client
+        .get(media_url.clone())
+        .timeout(config.download_timeout)
+        .send()
+        .await
+        .context("Failed to download media")?
+        .error_for_status()
+        .context("Media download returned error status")?;
+
+    let mime_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .trim()
+        .to_string();
+
+    let filename = media_url
+        .path_segments()
+        .and_then(|mut s| s.next_back())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("media")
+        .to_string();
+
+    let data = response.bytes().await.context("Failed to read media")?;
+    let hash = media_store.store(&data).await?;
+    Ok((hash, filename, mime_type))
+}
+
+async fn handle_add_command(
+    room_id: &str,
+    args: &[&str],
+    database: &Arc<Database>,
+    http_client: &reqwest::Client,
+    config: &Config,
+    media_store: &MediaStore,
+    ap_detector: &ActivityPubDetector,
+) -> CommandResult {
+    let Some(name) = args.first().copied() else {
+        return CommandResult::Response(
+            "Usage: `!embedbot admin add-command <name> [media_url] [text...]`".to_string(),
+        );
+    };
+
+    if !name.starts_with('!') {
+        return CommandResult::Response("Command name must start with `!`.".to_string());
+    }
+
+    let mut rest = &args[1..];
+    let mut media_info = None;
+
+    if let Some(first) = rest.first() {
+        if first.starts_with("http://") || first.starts_with("https://") {
+            match fetch_and_store_media(first, http_client, config, media_store, ap_detector).await
+            {
+                Ok(info) => media_info = Some(info),
+                Err(e) => {
+                    return CommandResult::Response(format!("Failed to fetch media: {}", e));
+                }
+            }
+            rest = &rest[1..];
+        }
+    }
+
+    let text = if rest.is_empty() {
+        None
+    } else {
+        Some(rest.join(" "))
+    };
+
+    if text.is_none() && media_info.is_none() {
+        return CommandResult::Response(
+            "Must provide at least text or a media URL.\n\n\
+             Usage: `!embedbot admin add-command <name> [media_url] [text...]`"
+                .to_string(),
+        );
+    }
+
+    let (cas_hash, filename, mime_type) = match &media_info {
+        Some((h, f, m)) => (Some(h.as_str()), Some(f.as_str()), Some(m.as_str())),
+        None => (None, None, None),
+    };
+
+    let response_id = match database
+        .create_canned_response(text.as_deref(), cas_hash, filename, mime_type)
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            error!("Failed to create canned response: {:?}", e);
+            return CommandResult::Response(format!("Failed to create response: {}", e));
+        }
+    };
+
+    match database
+        .add_custom_command(room_id, name, response_id)
+        .await
+    {
+        Ok(()) => CommandResult::Response(format!(
+            "Custom command `{}` has been set{}.",
+            name,
+            if media_info.is_some() {
+                " (with media)"
+            } else {
+                ""
+            }
+        )),
+        Err(e) => {
+            error!("Failed to add custom command: {:?}", e);
+            CommandResult::Response(format!("Failed to add command: {}", e))
+        }
+    }
+}
+
+async fn handle_remove_command(
+    room_id: &str,
+    args: &[&str],
+    database: &Arc<Database>,
+) -> CommandResult {
+    let Some(name) = args.first().copied() else {
+        return CommandResult::Response(
+            "Usage: `!embedbot admin remove-command <name>`".to_string(),
+        );
+    };
+
+    match database.remove_custom_command(room_id, name).await {
+        Ok(true) => CommandResult::Response(format!("Custom command `{}` has been removed.", name)),
+        Ok(false) => {
+            CommandResult::Response(format!("No custom command `{}` found in this room.", name))
+        }
+        Err(e) => {
+            error!("Failed to remove custom command: {:?}", e);
+            CommandResult::Response(format!("Failed to remove command: {}", e))
+        }
+    }
+}
+
+async fn handle_list_commands(room_id: &str, database: &Arc<Database>) -> CommandResult {
+    match database.list_custom_commands(room_id).await {
+        Ok(cmds) if cmds.is_empty() => {
+            CommandResult::Response("No custom commands configured for this room.".to_string())
+        }
+        Ok(cmds) => {
+            let mut lines = vec![format!("**Custom commands ({}):**\n", cmds.len())];
+            for cmd in &cmds {
+                let has_media = cmd.response.media_cas_hash.is_some();
+                let text_preview = cmd.response.text_markdown.as_deref().unwrap_or("(no text)");
+                let truncated = if text_preview.len() > 50 {
+                    format!("{}…", &text_preview[..50])
+                } else {
+                    text_preview.to_string()
+                };
+                lines.push(format!(
+                    "- `{}` — {}{}",
+                    cmd.command_name,
+                    truncated,
+                    if has_media { " 📎" } else { "" }
+                ));
+            }
+            CommandResult::Response(lines.join("\n"))
+        }
+        Err(e) => {
+            error!("Failed to list custom commands: {:?}", e);
+            CommandResult::Response(format!("Failed to list commands: {}", e))
+        }
+    }
+}
+
+async fn handle_add_autoresponder(
+    room_id: &str,
+    args: &[&str],
+    database: &Arc<Database>,
+    http_client: &reqwest::Client,
+    config: &Config,
+    media_store: &MediaStore,
+    ap_detector: &ActivityPubDetector,
+) -> CommandResult {
+    let Some(pattern) = args.first().copied() else {
+        return CommandResult::Response(
+            "Usage: `!embedbot admin add-autoresponder <pattern> [probability] [media_url] [text...]`"
+                .to_string(),
+        );
+    };
+
+    if regex::Regex::new(pattern).is_err() {
+        return CommandResult::Response(format!("`{}` is not a valid regex pattern.", pattern));
+    }
+
+    let mut rest = &args[1..];
+    let mut probability = 1.0;
+
+    if let Some(first) = rest.first() {
+        if let Ok(p) = first.parse::<f64>() {
+            if (0.0..=1.0).contains(&p) {
+                probability = p;
+                rest = &rest[1..];
+            }
+        }
+    }
+
+    let mut media_info = None;
+    if let Some(first) = rest.first() {
+        if first.starts_with("http://") || first.starts_with("https://") {
+            match fetch_and_store_media(first, http_client, config, media_store, ap_detector).await
+            {
+                Ok(info) => media_info = Some(info),
+                Err(e) => {
+                    return CommandResult::Response(format!("Failed to fetch media: {}", e));
+                }
+            }
+            rest = &rest[1..];
+        }
+    }
+
+    let text = if rest.is_empty() {
+        None
+    } else {
+        Some(rest.join(" "))
+    };
+
+    if text.is_none() && media_info.is_none() {
+        return CommandResult::Response(
+            "Must provide at least text or a media URL.\n\n\
+             Usage: `!embedbot admin add-autoresponder <pattern> [probability] [media_url] [text...]`"
+                .to_string(),
+        );
+    }
+
+    let (cas_hash, filename, mime_type) = match &media_info {
+        Some((h, f, m)) => (Some(h.as_str()), Some(f.as_str()), Some(m.as_str())),
+        None => (None, None, None),
+    };
+
+    let response_id = match database
+        .create_canned_response(text.as_deref(), cas_hash, filename, mime_type)
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            error!("Failed to create canned response: {:?}", e);
+            return CommandResult::Response(format!("Failed to create response: {}", e));
+        }
+    };
+
+    match database
+        .add_autoresponder(room_id, pattern, probability, response_id)
+        .await
+    {
+        Ok(()) => {
+            let prob_str = if probability < 1.0 {
+                format!(" ({}% chance)", (probability * 100.0) as u32)
+            } else {
+                String::new()
+            };
+            CommandResult::Response(format!(
+                "Autoresponder for `{}`{} has been set{}.",
+                pattern,
+                prob_str,
+                if media_info.is_some() {
+                    " (with media)"
+                } else {
+                    ""
+                }
+            ))
+        }
+        Err(e) => {
+            error!("Failed to add autoresponder: {:?}", e);
+            CommandResult::Response(format!("Failed to add autoresponder: {}", e))
+        }
+    }
+}
+
+async fn handle_remove_autoresponder(
+    room_id: &str,
+    args: &[&str],
+    database: &Arc<Database>,
+) -> CommandResult {
+    let Some(pattern) = args.first().copied() else {
+        return CommandResult::Response(
+            "Usage: `!embedbot admin remove-autoresponder <pattern>`".to_string(),
+        );
+    };
+
+    match database.remove_autoresponder(room_id, pattern).await {
+        Ok(true) => {
+            CommandResult::Response(format!("Autoresponder for `{}` has been removed.", pattern))
+        }
+        Ok(false) => CommandResult::Response(format!(
+            "No autoresponder for `{}` found in this room.",
+            pattern
+        )),
+        Err(e) => {
+            error!("Failed to remove autoresponder: {:?}", e);
+            CommandResult::Response(format!("Failed to remove autoresponder: {}", e))
+        }
+    }
+}
+
+async fn handle_list_autoresponders(room_id: &str, database: &Arc<Database>) -> CommandResult {
+    match database.get_autoresponders(room_id).await {
+        Ok(autos) if autos.is_empty() => {
+            CommandResult::Response("No autoresponders configured for this room.".to_string())
+        }
+        Ok(autos) => {
+            let mut lines = vec![format!("**Autoresponders ({}):**\n", autos.len())];
+            for auto in &autos {
+                let has_media = auto.response.media_cas_hash.is_some();
+                let text_preview = auto
+                    .response
+                    .text_markdown
+                    .as_deref()
+                    .unwrap_or("(no text)");
+                let truncated = if text_preview.len() > 50 {
+                    format!("{}…", &text_preview[..50])
+                } else {
+                    text_preview.to_string()
+                };
+                let prob_str = if auto.probability < 1.0 {
+                    format!(" ({}%)", (auto.probability * 100.0) as u32)
+                } else {
+                    String::new()
+                };
+                lines.push(format!(
+                    "- `{}`{} — {}{}",
+                    auto.pattern,
+                    prob_str,
+                    truncated,
+                    if has_media { " 📎" } else { "" }
+                ));
+            }
+            CommandResult::Response(lines.join("\n"))
+        }
+        Err(e) => {
+            error!("Failed to list autoresponders: {:?}", e);
+            CommandResult::Response(format!("Failed to list autoresponders: {}", e))
+        }
+    }
+}
+
+/// Check autoresponders for a room. Returns the first matching canned response
+/// (after rolling against the configured probability), or `None`.
+pub async fn check_autoresponders(
+    body: &str,
+    room_id: &str,
+    database: &Database,
+) -> Option<CannedResponse> {
+    let autoresponders = match database.get_autoresponders(room_id).await {
+        Ok(a) => a,
+        Err(e) => {
+            error!("Failed to get autoresponders: {:?}", e);
+            return None;
+        }
+    };
+
+    for auto in autoresponders {
+        let re = match regex::Regex::new(&auto.pattern) {
+            Ok(re) => re,
+            Err(e) => {
+                warn!("Invalid autoresponder pattern '{}': {}", auto.pattern, e);
+                continue;
+            }
+        };
+        if re.is_match(body) {
+            if auto.probability < 1.0 {
+                use rand::Rng;
+                if rand::thread_rng().r#gen::<f64>() >= auto.probability {
+                    continue;
+                }
+            }
+            return Some(auto.response);
+        }
+    }
+
+    None
+}
+
 pub(crate) async fn remove_device(
     client: &Client,
     config: &Config,
@@ -452,6 +916,32 @@ mod tests {
         Arc::new(Database::open_in_memory().await.unwrap())
     }
 
+    async fn run_cmd(
+        body: &str,
+        sender: &str,
+        room_id: &str,
+        config: &Config,
+        client: &Client,
+        database: &Arc<Database>,
+    ) -> CommandResult {
+        let dir = tempfile::TempDir::new().unwrap();
+        let media_store = crate::cas::MediaStore::open(dir.path()).await.unwrap();
+        let http_client = reqwest::Client::new();
+        let ap_detector = crate::activitypub::ActivityPubDetector::new();
+        handle_command(
+            body,
+            sender,
+            room_id,
+            config,
+            client,
+            database,
+            &http_client,
+            &media_store,
+            &ap_detector,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn test_not_a_command() {
         let config = test_config(vec![]);
@@ -462,7 +952,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "hello world",
             "@user:example.com",
             "!testroom:example.com",
@@ -484,7 +974,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "https://example.com",
             "@user:example.com",
             "!testroom:example.com",
@@ -506,7 +996,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot",
             "@user:example.com",
             "!testroom:example.com",
@@ -525,6 +1015,416 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_custom_command_trigger() {
+        let config = test_config(vec!["@admin:example.com"]);
+        let client = Client::builder()
+            .homeserver_url("https://matrix.example.com")
+            .build()
+            .await
+            .unwrap();
+        let db = test_database().await;
+
+        // Set up a custom command via DB directly.
+        let rid = db
+            .create_canned_response(Some("Here are useful links!"), None, None, None)
+            .await
+            .unwrap();
+        db.add_custom_command("!testroom:example.com", "!links", rid)
+            .await
+            .unwrap();
+
+        // Should trigger the custom command.
+        let result = run_cmd(
+            "!links",
+            "@user:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::CannedResponse(cr) => {
+                assert_eq!(cr.text_markdown.as_deref(), Some("Here are useful links!"));
+            }
+            _ => panic!("Expected CannedResponse"),
+        }
+
+        // Different room should not match.
+        let result = run_cmd(
+            "!links",
+            "@user:example.com",
+            "!otherroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        assert!(matches!(result, CommandResult::NotACommand));
+
+        // Random non-command text should not match.
+        let result = run_cmd(
+            "hello",
+            "@user:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        assert!(matches!(result, CommandResult::NotACommand));
+    }
+
+    #[tokio::test]
+    async fn test_admin_add_and_remove_command() {
+        let config = test_config(vec!["@admin:example.com"]);
+        let client = Client::builder()
+            .homeserver_url("https://matrix.example.com")
+            .build()
+            .await
+            .unwrap();
+        let db = test_database().await;
+
+        // add-command with text only
+        let result = run_cmd(
+            "!embedbot admin add-command !greet Hello, world!",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match &result {
+            CommandResult::Response(msg) => {
+                assert!(msg.contains("has been set"), "got: {}", msg);
+                assert!(msg.contains("!greet"));
+            }
+            _ => panic!("Expected Response"),
+        }
+
+        // Verify the command exists.
+        let cr = db
+            .get_custom_command("!testroom:example.com", "!greet")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cr.text_markdown.as_deref(), Some("Hello, world!"));
+
+        // remove-command
+        let result = run_cmd(
+            "!embedbot admin remove-command !greet",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => assert!(msg.contains("removed")),
+            _ => panic!("Expected Response"),
+        }
+
+        assert!(
+            db.get_custom_command("!testroom:example.com", "!greet")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admin_add_command_missing_args() {
+        let config = test_config(vec!["@admin:example.com"]);
+        let client = Client::builder()
+            .homeserver_url("https://matrix.example.com")
+            .build()
+            .await
+            .unwrap();
+        let db = test_database().await;
+
+        let result = run_cmd(
+            "!embedbot admin add-command",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => assert!(msg.contains("Usage")),
+            _ => panic!("Expected Response"),
+        }
+
+        // Name without text or media
+        let result = run_cmd(
+            "!embedbot admin add-command !test",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => assert!(msg.contains("Must provide")),
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_add_command_no_bang() {
+        let config = test_config(vec!["@admin:example.com"]);
+        let client = Client::builder()
+            .homeserver_url("https://matrix.example.com")
+            .build()
+            .await
+            .unwrap();
+        let db = test_database().await;
+
+        let result = run_cmd(
+            "!embedbot admin add-command greet Hello",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => assert!(msg.contains("must start with `!`")),
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_list_commands() {
+        let config = test_config(vec!["@admin:example.com"]);
+        let client = Client::builder()
+            .homeserver_url("https://matrix.example.com")
+            .build()
+            .await
+            .unwrap();
+        let db = test_database().await;
+
+        // Empty list
+        let result = run_cmd(
+            "!embedbot admin list-commands",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => assert!(msg.contains("No custom commands")),
+            _ => panic!("Expected Response"),
+        }
+
+        // Add one and list
+        let rid = db
+            .create_canned_response(Some("hi"), None, None, None)
+            .await
+            .unwrap();
+        db.add_custom_command("!testroom:example.com", "!hi", rid)
+            .await
+            .unwrap();
+
+        let result = run_cmd(
+            "!embedbot admin list-commands",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => {
+                assert!(msg.contains("!hi"));
+                assert!(msg.contains("1"));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_add_and_remove_autoresponder() {
+        let config = test_config(vec!["@admin:example.com"]);
+        let client = Client::builder()
+            .homeserver_url("https://matrix.example.com")
+            .build()
+            .await
+            .unwrap();
+        let db = test_database().await;
+
+        let result = run_cmd(
+            "!embedbot admin add-autoresponder hello 0.5 hi there!",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match &result {
+            CommandResult::Response(msg) => {
+                assert!(msg.contains("has been set"), "got: {}", msg);
+                assert!(msg.contains("50%"));
+            }
+            _ => panic!("Expected Response"),
+        }
+
+        let autos = db
+            .get_autoresponders("!testroom:example.com")
+            .await
+            .unwrap();
+        assert_eq!(autos.len(), 1);
+        assert_eq!(autos[0].pattern, "hello");
+        assert_eq!(autos[0].probability, 0.5);
+        assert_eq!(
+            autos[0].response.text_markdown.as_deref(),
+            Some("hi there!")
+        );
+
+        // list
+        let result = run_cmd(
+            "!embedbot admin list-autoresponders",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => {
+                assert!(msg.contains("hello"));
+                assert!(msg.contains("50%"));
+            }
+            _ => panic!("Expected Response"),
+        }
+
+        // remove
+        let result = run_cmd(
+            "!embedbot admin remove-autoresponder hello",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => assert!(msg.contains("removed")),
+            _ => panic!("Expected Response"),
+        }
+
+        assert!(
+            db.get_autoresponders("!testroom:example.com")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admin_add_autoresponder_invalid_regex() {
+        let config = test_config(vec!["@admin:example.com"]);
+        let client = Client::builder()
+            .homeserver_url("https://matrix.example.com")
+            .build()
+            .await
+            .unwrap();
+        let db = test_database().await;
+
+        let result = run_cmd(
+            "!embedbot admin add-autoresponder [invalid response text",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => assert!(msg.contains("not a valid regex")),
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_autoresponders_basic() {
+        let db = test_database().await;
+        let room = "!testroom:example.com";
+
+        let rid = db
+            .create_canned_response(Some("world!"), None, None, None)
+            .await
+            .unwrap();
+        db.add_autoresponder(room, "hello", 1.0, rid).await.unwrap();
+
+        let result = check_autoresponders("hello world", room, &db).await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().text_markdown.as_deref(), Some("world!"));
+
+        let result = check_autoresponders("goodbye", room, &db).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_check_autoresponders_probability_zero() {
+        let db = test_database().await;
+        let room = "!testroom:example.com";
+
+        let rid = db
+            .create_canned_response(Some("nope"), None, None, None)
+            .await
+            .unwrap();
+        db.add_autoresponder(room, "hi", 0.0, rid).await.unwrap();
+
+        // With probability 0, should never trigger.
+        for _ in 0..20 {
+            assert!(check_autoresponders("hi", room, &db).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_help_includes_new_commands() {
+        let config = test_config(vec!["@admin:example.com"]);
+        let client = Client::builder()
+            .homeserver_url("https://matrix.example.com")
+            .build()
+            .await
+            .unwrap();
+        let db = test_database().await;
+
+        let result = run_cmd(
+            "!embedbot admin",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => {
+                assert!(msg.contains("add-command"));
+                assert!(msg.contains("remove-command"));
+                assert!(msg.contains("list-commands"));
+                assert!(msg.contains("add-autoresponder"));
+                assert!(msg.contains("remove-autoresponder"));
+                assert!(msg.contains("list-autoresponders"));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_unknown_subcommand() {
         let config = test_config(vec![]);
         let client = Client::builder()
@@ -534,7 +1434,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot foobar",
             "@user:example.com",
             "!testroom:example.com",
@@ -562,7 +1462,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot admin remove-device FOOBAR",
             "@random:example.com",
             "!testroom:example.com",
@@ -587,7 +1487,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot admin",
             "@admin:example.com",
             "!testroom:example.com",
@@ -617,7 +1517,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot admin nope",
             "@admin:example.com",
             "!testroom:example.com",
@@ -645,7 +1545,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot admin remove-device",
             "@admin:example.com",
             "!testroom:example.com",
@@ -670,7 +1570,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot admin reset-identity",
             "@random:example.com",
             "!testroom:example.com",
@@ -695,7 +1595,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot admin enable-key-sharing !test:example.com",
             "@admin:example.com",
             "!testroom:example.com",
@@ -730,7 +1630,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot admin enable-key-sharing not-a-room-id",
             "@admin:example.com",
             "!testroom:example.com",
@@ -757,7 +1657,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot admin enable-key-sharing",
             "@admin:example.com",
             "!testroom:example.com",
@@ -784,7 +1684,7 @@ mod tests {
 
         db.enable_key_sharing("!test:example.com").await.unwrap();
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot admin disable-key-sharing !test:example.com",
             "@admin:example.com",
             "!testroom:example.com",
@@ -818,7 +1718,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot admin list-key-sharing",
             "@admin:example.com",
             "!testroom:example.com",
@@ -846,7 +1746,7 @@ mod tests {
         let db = test_database().await;
 
         // Key sharing is NOT enabled for this room.
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot export-keys",
             "@random:example.com",
             "!myroom:example.com",
@@ -879,7 +1779,7 @@ mod tests {
 
         // The test Client has no OlmMachine, so the export will fail
         // gracefully with an error message.
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot export-keys",
             "@random:example.com",
             "!myroom:example.com",
@@ -906,7 +1806,7 @@ mod tests {
             .unwrap();
         let db = test_database().await;
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot",
             "@user:example.com",
             "!testroom:example.com",
@@ -936,7 +1836,7 @@ mod tests {
         db.enable_key_sharing("!room1:example.com").await.unwrap();
         db.enable_key_sharing("!room2:example.com").await.unwrap();
 
-        let result = handle_command(
+        let result = run_cmd(
             "!embedbot admin list-key-sharing",
             "@admin:example.com",
             "!testroom:example.com",

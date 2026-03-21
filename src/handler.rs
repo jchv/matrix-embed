@@ -29,9 +29,10 @@ use url::Url;
 
 use crate::{
     activitypub::ActivityPubDetector,
+    cas::MediaStore,
     command,
     config::Config,
-    db::Database,
+    db::{CannedResponse, Database},
     extract::extract_url,
     metadata::Metadata,
     processing::{MessageParams, process_metadata, process_response},
@@ -66,6 +67,7 @@ pub async fn handle_message(
     tracker: Arc<EventTracker>,
     ap_detector: Arc<ActivityPubDetector>,
     database: Arc<Database>,
+    media_store: Arc<MediaStore>,
 ) -> Result<()> {
     if let Some(Relation::Replacement(replacement)) = &event.content.relates_to {
         let original_event_id = replacement.event_id.clone();
@@ -89,6 +91,9 @@ pub async fn handle_message(
         &config,
         &client,
         &database,
+        &http_client,
+        &media_store,
+        &ap_detector,
     )
     .await
     {
@@ -132,6 +137,13 @@ pub async fn handle_message(
             .await?;
             return Ok(());
         }
+        command::CommandResult::CannedResponse(canned) => {
+            let eid = event.event_id.clone();
+            if let Err(e) = send_canned_response(&room, &canned, &eid, &media_store).await {
+                error!("Failed to send canned response: {:?}", e);
+            }
+            return Ok(());
+        }
         command::CommandResult::NotACommand => {}
     }
 
@@ -140,6 +152,11 @@ pub async fn handle_message(
     } else {
         None
     };
+
+    let body = event.content.body().to_owned();
+    let event_id_for_auto = event.event_id.clone();
+    let room_id_str = room.room_id().to_string();
+    let room_for_auto = room.clone();
 
     let original_event_id = event.event_id.clone();
     run_embed_task(
@@ -153,6 +170,15 @@ pub async fn handle_message(
         ap_detector,
     )
     .await;
+
+    // Autoresponders run last; skipped when earlier branches return early.
+    if let Some(canned) = command::check_autoresponders(&body, &room_id_str, &database).await {
+        if let Err(e) =
+            send_canned_response(&room_for_auto, &canned, &event_id_for_auto, &media_store).await
+        {
+            warn!("Failed to send autoresponder: {:?}", e);
+        }
+    }
 
     Ok(())
 }
@@ -457,6 +483,48 @@ pub async fn download_and_upload(
         .await?;
 
     Ok(response.event_id)
+}
+
+/// Send a canned response (from a custom command or autoresponder) as a reply.
+async fn send_canned_response(
+    room: &Room,
+    canned: &CannedResponse,
+    event_id: &matrix_sdk::ruma::EventId,
+    media_store: &MediaStore,
+) -> Result<()> {
+    let reply = Reply {
+        event_id: event_id.to_owned(),
+        enforce_thread: EnforceThread::MaybeThreaded,
+    };
+
+    if let Some(cas_hash) = &canned.media_cas_hash {
+        let data = media_store.load(cas_hash).await?;
+        let mime_str = canned
+            .media_mime_type
+            .as_deref()
+            .unwrap_or("application/octet-stream");
+        let mime: mime_guess::Mime = mime_str
+            .parse()
+            .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM);
+        let filename = canned.media_filename.as_deref().unwrap_or("media");
+        let caption = canned
+            .text_markdown
+            .as_deref()
+            .map(TextMessageEventContent::markdown);
+
+        let attach_config = AttachmentConfig::new().caption(caption).reply(Some(reply));
+
+        room.send_attachment(filename, &mime, data, attach_config)
+            .await?;
+    } else if let Some(text) = &canned.text_markdown {
+        let mut content = RoomMessageEventContent::text_markdown(text);
+        content.relates_to = Some(Relation::Reply {
+            in_reply_to: InReplyTo::new(event_id.to_owned()),
+        });
+        room.send(content).await?;
+    }
+
+    Ok(())
 }
 
 /// Keep a typing indicator active for the duration of an async operation.

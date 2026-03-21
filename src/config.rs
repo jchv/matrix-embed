@@ -9,6 +9,7 @@ use url::Url;
 const DEFAULT_HOMESERVER_URL: &str = "https://matrix.org";
 const DEFAULT_STATE_STORE_PATH: &str = "state";
 const DEFAULT_DATABASE_PATH: &str = "matrix-embed.db";
+const DEFAULT_MEDIA_STORE_PATH: &str = "media";
 const DEFAULT_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 const DEFAULT_DOWNLOAD_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_MAX_EMBED_DESCRIPTION_CHARS: usize = 640;
@@ -80,6 +81,10 @@ pub struct Args {
     #[arg(long, default_value = DEFAULT_DATABASE_PATH)]
     pub database_path: PathBuf,
 
+    /// Path to the content-addressable media store directory
+    #[arg(long, default_value = DEFAULT_MEDIA_STORE_PATH)]
+    pub media_store_path: PathBuf,
+
     /// Path to avatar to set, if none is set
     #[arg(long)]
     pub avatar_file: Option<PathBuf>,
@@ -126,6 +131,7 @@ pub struct Config {
     pub password: Option<String>,
     pub state_store_path: PathBuf,
     pub database_path: PathBuf,
+    pub media_store_path: PathBuf,
     pub max_file_size: u64,
     pub download_timeout: Duration,
     pub trusted_users: Vec<String>,
@@ -229,6 +235,7 @@ impl Config {
             password,
             state_store_path: args.state_store_path,
             database_path: args.database_path,
+            media_store_path: args.media_store_path,
             max_file_size: args.max_file_size,
             download_timeout: Duration::from_secs(args.download_timeout_seconds),
             trusted_users: args.trusted_users,
@@ -273,6 +280,7 @@ impl Default for Config {
             password: None,
             state_store_path: PathBuf::from(DEFAULT_STATE_STORE_PATH),
             database_path: PathBuf::from(DEFAULT_DATABASE_PATH),
+            media_store_path: PathBuf::from(DEFAULT_MEDIA_STORE_PATH),
             max_file_size: DEFAULT_MAX_FILE_SIZE,
             download_timeout: Duration::from_secs(DEFAULT_DOWNLOAD_TIMEOUT_SECONDS),
             trusted_users: vec![],
