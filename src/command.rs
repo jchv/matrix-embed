@@ -95,13 +95,23 @@ Available subcommands:\n\
 - `enable-key-sharing` — Enable automatic room key distribution in this room\n\
 - `disable-key-sharing` — Disable automatic room key distribution in this room\n\
 - `list-key-sharing` — List all rooms with key sharing enabled\n\
-- `add-command <name> [media_url] [text...]` — Add/update a custom command\n\
-- `remove-command <name>` — Remove a custom command\n\
-- `list-commands` — List custom commands for this room\n\
-- `add-autoresponder <pattern> [probability] [media_url] [text...]` — Add/update an autoresponder\n\
-- `remove-autoresponder <pattern>` — Remove an autoresponder\n\
-- `list-autoresponders` — List autoresponders for this room"
+- `add-command [--global] <name> [media_url] [text...]` — Add/update a custom command\n\
+- `remove-command [--global] <name>` — Remove a custom command\n\
+- `list-commands [--global]` — List custom commands for this room (or globally)\n\
+- `add-autoresponder [--global] <pattern> [probability] [media_url] [text...]` — Add/update an autoresponder\n\
+- `remove-autoresponder [--global] <pattern>` — Remove an autoresponder\n\
+- `list-autoresponders [--global]` — List autoresponders for this room (or globally)"
         .to_string()
+}
+
+/// Parses a `--global` flag from the front of args. Returns the effective
+/// room_id (`""` when global) and the remaining args.
+fn parse_global_flag<'a>(room_id: &'a str, args: &'a [&'a str]) -> (&'a str, &'a [&'a str]) {
+    if args.first() == Some(&"--global") {
+        ("", &args[1..])
+    } else {
+        (room_id, args)
+    }
 }
 
 async fn handle_admin(
@@ -148,7 +158,7 @@ async fn handle_admin(
             .await
         }
         Some("remove-command") => handle_remove_command(room_id, &args[1..], database).await,
-        Some("list-commands") => handle_list_commands(room_id, database).await,
+        Some("list-commands") => handle_list_commands(room_id, &args[1..], database).await,
         Some("add-autoresponder") => {
             handle_add_autoresponder(
                 room_id,
@@ -164,7 +174,9 @@ async fn handle_admin(
         Some("remove-autoresponder") => {
             handle_remove_autoresponder(room_id, &args[1..], database).await
         }
-        Some("list-autoresponders") => handle_list_autoresponders(room_id, database).await,
+        Some("list-autoresponders") => {
+            handle_list_autoresponders(room_id, &args[1..], database).await
+        }
         Some(other) => CommandResult::Response(format!(
             "Unknown admin command `{}`. {}",
             other,
@@ -527,9 +539,13 @@ async fn handle_add_command(
     media_store: &MediaStore,
     ap_detector: &ActivityPubDetector,
 ) -> CommandResult {
+    let (room_id, args) = parse_global_flag(room_id, args);
+    let scope = if room_id.is_empty() { " globally" } else { "" };
+
     let Some(name) = args.first().copied() else {
         return CommandResult::Response(
-            "Usage: `!embedbot admin add-command <name> [media_url] [text...]`".to_string(),
+            "Usage: `!embedbot admin add-command [--global] <name> [media_url] [text...]`"
+                .to_string(),
         );
     };
 
@@ -588,8 +604,9 @@ async fn handle_add_command(
         .await
     {
         Ok(()) => CommandResult::Response(format!(
-            "Custom command `{}` has been set{}.",
+            "Custom command `{}` has been set{}{}.",
             name,
+            scope,
             if media_info.is_some() {
                 " (with media)"
             } else {
@@ -608,16 +625,23 @@ async fn handle_remove_command(
     args: &[&str],
     database: &Arc<Database>,
 ) -> CommandResult {
+    let (room_id, args) = parse_global_flag(room_id, args);
+    let scope = if room_id.is_empty() {
+        "globally"
+    } else {
+        "in this room"
+    };
+
     let Some(name) = args.first().copied() else {
         return CommandResult::Response(
-            "Usage: `!embedbot admin remove-command <name>`".to_string(),
+            "Usage: `!embedbot admin remove-command [--global] <name>`".to_string(),
         );
     };
 
     match database.remove_custom_command(room_id, name).await {
         Ok(true) => CommandResult::Response(format!("Custom command `{}` has been removed.", name)),
         Ok(false) => {
-            CommandResult::Response(format!("No custom command `{}` found in this room.", name))
+            CommandResult::Response(format!("No custom command `{}` found {}.", name, scope))
         }
         Err(e) => {
             error!("Failed to remove custom command: {:?}", e);
@@ -626,13 +650,24 @@ async fn handle_remove_command(
     }
 }
 
-async fn handle_list_commands(room_id: &str, database: &Arc<Database>) -> CommandResult {
+async fn handle_list_commands(
+    room_id: &str,
+    args: &[&str],
+    database: &Arc<Database>,
+) -> CommandResult {
+    let (room_id, _args) = parse_global_flag(room_id, args);
+    let scope = if room_id.is_empty() {
+        "globally"
+    } else {
+        "for this room"
+    };
+
     match database.list_custom_commands(room_id).await {
         Ok(cmds) if cmds.is_empty() => {
-            CommandResult::Response("No custom commands configured for this room.".to_string())
+            CommandResult::Response(format!("No custom commands configured {}.", scope))
         }
         Ok(cmds) => {
-            let mut lines = vec![format!("**Custom commands ({}):**\n", cmds.len())];
+            let mut lines = vec![format!("**Custom commands {} ({}):**\n", scope, cmds.len())];
             for cmd in &cmds {
                 let has_media = cmd.response.media_cas_hash.is_some();
                 let text_preview = cmd.response.text_markdown.as_deref().unwrap_or("(no text)");
@@ -666,9 +701,12 @@ async fn handle_add_autoresponder(
     media_store: &MediaStore,
     ap_detector: &ActivityPubDetector,
 ) -> CommandResult {
+    let (room_id, args) = parse_global_flag(room_id, args);
+    let scope = if room_id.is_empty() { " globally" } else { "" };
+
     let Some(pattern) = args.first().copied() else {
         return CommandResult::Response(
-            "Usage: `!embedbot admin add-autoresponder <pattern> [probability] [media_url] [text...]`"
+            "Usage: `!embedbot admin add-autoresponder [--global] <pattern> [probability] [media_url] [text...]`"
                 .to_string(),
         );
     };
@@ -744,9 +782,10 @@ async fn handle_add_autoresponder(
                 String::new()
             };
             CommandResult::Response(format!(
-                "Autoresponder for `{}`{} has been set{}.",
+                "Autoresponder for `{}`{} has been set{}{}.",
                 pattern,
                 prob_str,
+                scope,
                 if media_info.is_some() {
                     " (with media)"
                 } else {
@@ -766,9 +805,16 @@ async fn handle_remove_autoresponder(
     args: &[&str],
     database: &Arc<Database>,
 ) -> CommandResult {
+    let (room_id, args) = parse_global_flag(room_id, args);
+    let scope = if room_id.is_empty() {
+        "globally"
+    } else {
+        "in this room"
+    };
+
     let Some(pattern) = args.first().copied() else {
         return CommandResult::Response(
-            "Usage: `!embedbot admin remove-autoresponder <pattern>`".to_string(),
+            "Usage: `!embedbot admin remove-autoresponder [--global] <pattern>`".to_string(),
         );
     };
 
@@ -777,8 +823,8 @@ async fn handle_remove_autoresponder(
             CommandResult::Response(format!("Autoresponder for `{}` has been removed.", pattern))
         }
         Ok(false) => CommandResult::Response(format!(
-            "No autoresponder for `{}` found in this room.",
-            pattern
+            "No autoresponder for `{}` found {}.",
+            pattern, scope
         )),
         Err(e) => {
             error!("Failed to remove autoresponder: {:?}", e);
@@ -787,13 +833,24 @@ async fn handle_remove_autoresponder(
     }
 }
 
-async fn handle_list_autoresponders(room_id: &str, database: &Arc<Database>) -> CommandResult {
-    match database.get_autoresponders(room_id).await {
+async fn handle_list_autoresponders(
+    room_id: &str,
+    args: &[&str],
+    database: &Arc<Database>,
+) -> CommandResult {
+    let (room_id, _args) = parse_global_flag(room_id, args);
+    let scope = if room_id.is_empty() {
+        "globally"
+    } else {
+        "for this room"
+    };
+
+    match database.list_autoresponders(room_id).await {
         Ok(autos) if autos.is_empty() => {
-            CommandResult::Response("No autoresponders configured for this room.".to_string())
+            CommandResult::Response(format!("No autoresponders configured {}.", scope))
         }
         Ok(autos) => {
-            let mut lines = vec![format!("**Autoresponders ({}):**\n", autos.len())];
+            let mut lines = vec![format!("**Autoresponders {} ({}):**\n", scope, autos.len())];
             for auto in &autos {
                 let has_media = auto.response.media_cas_hash.is_some();
                 let text_preview = auto
@@ -1390,6 +1447,211 @@ mod tests {
         for _ in 0..20 {
             assert!(check_autoresponders("hi", room, &db).await.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn test_admin_add_global_command() {
+        let config = test_config(vec!["@admin:example.com"]);
+        let client = Client::builder()
+            .homeserver_url("https://matrix.example.com")
+            .build()
+            .await
+            .unwrap();
+        let db = test_database().await;
+
+        let result = run_cmd(
+            "!embedbot admin add-command --global !greet Hello global!",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match &result {
+            CommandResult::Response(msg) => {
+                assert!(msg.contains("has been set"), "got: {}", msg);
+                assert!(msg.contains("globally"));
+            }
+            _ => panic!("Expected Response"),
+        }
+
+        // Should be visible from any room.
+        let result = run_cmd(
+            "!greet",
+            "@user:example.com",
+            "!anyroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::CannedResponse(cr) => {
+                assert_eq!(cr.text_markdown.as_deref(), Some("Hello global!"));
+            }
+            _ => panic!("Expected CannedResponse"),
+        }
+
+        // Room-specific override takes priority.
+        let result = run_cmd(
+            "!embedbot admin add-command !greet Hello room!",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        assert!(matches!(result, CommandResult::Response(_)));
+
+        let result = run_cmd(
+            "!greet",
+            "@user:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::CannedResponse(cr) => {
+                assert_eq!(cr.text_markdown.as_deref(), Some("Hello room!"));
+            }
+            _ => panic!("Expected CannedResponse"),
+        }
+
+        // Other rooms still see global.
+        let result = run_cmd(
+            "!greet",
+            "@user:example.com",
+            "!other:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::CannedResponse(cr) => {
+                assert_eq!(cr.text_markdown.as_deref(), Some("Hello global!"));
+            }
+            _ => panic!("Expected CannedResponse"),
+        }
+
+        // list-commands --global shows the global command.
+        let result = run_cmd(
+            "!embedbot admin list-commands --global",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => {
+                assert!(msg.contains("!greet"));
+                assert!(msg.contains("globally"));
+            }
+            _ => panic!("Expected Response"),
+        }
+
+        // remove --global
+        let result = run_cmd(
+            "!embedbot admin remove-command --global !greet",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => assert!(msg.contains("removed")),
+            _ => panic!("Expected Response"),
+        }
+
+        // Still have the room-specific one.
+        let result = run_cmd(
+            "!greet",
+            "@user:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        assert!(matches!(result, CommandResult::CannedResponse(_)));
+    }
+
+    #[tokio::test]
+    async fn test_admin_add_global_autoresponder() {
+        let config = test_config(vec!["@admin:example.com"]);
+        let client = Client::builder()
+            .homeserver_url("https://matrix.example.com")
+            .build()
+            .await
+            .unwrap();
+        let db = test_database().await;
+
+        let result = run_cmd(
+            "!embedbot admin add-autoresponder --global hello 0.5 hi there!",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match &result {
+            CommandResult::Response(msg) => {
+                assert!(msg.contains("has been set"), "got: {}", msg);
+                assert!(msg.contains("globally"));
+                assert!(msg.contains("50%"));
+            }
+            _ => panic!("Expected Response"),
+        }
+
+        // Should be visible from any room via check_autoresponders.
+        let result = check_autoresponders("hello world", "!anyroom:example.com", &db).await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().text_markdown.as_deref(), Some("hi there!"));
+
+        // list-autoresponders --global
+        let result = run_cmd(
+            "!embedbot admin list-autoresponders --global",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => {
+                assert!(msg.contains("hello"));
+                assert!(msg.contains("globally"));
+            }
+            _ => panic!("Expected Response"),
+        }
+
+        // remove --global
+        let result = run_cmd(
+            "!embedbot admin remove-autoresponder --global hello",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => assert!(msg.contains("removed")),
+            _ => panic!("Expected Response"),
+        }
+
+        let result = check_autoresponders("hello world", "!anyroom:example.com", &db).await;
+        assert!(result.is_none());
     }
 
     #[tokio::test]

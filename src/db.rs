@@ -356,6 +356,8 @@ impl Database {
         .context("remove_custom_command task panicked")?
     }
 
+    /// Look up a custom command, preferring a room-specific match over a global
+    /// one (room_id = `""`).
     pub async fn get_custom_command(
         &self,
         room_id: &str,
@@ -371,7 +373,9 @@ impl Database {
                         cr.media_filename, cr.media_mime_type
                  FROM custom_commands cc
                  JOIN canned_responses cr ON cc.response_id = cr.id
-                 WHERE cc.room_id = ?1 AND cc.command_name = ?2",
+                 WHERE cc.command_name = ?2 AND (cc.room_id = ?1 OR cc.room_id = '')
+                 ORDER BY (cc.room_id = '') ASC
+                 LIMIT 1",
                 rusqlite::params![&room_id, &command_name],
                 parse_canned_response,
             );
@@ -489,6 +493,8 @@ impl Database {
         .context("remove_autoresponder task panicked")?
     }
 
+    /// Return autoresponders that apply to a room: room-specific entries first,
+    /// then global ones (room_id = `""`).
     pub async fn get_autoresponders(&self, room_id: &str) -> Result<Vec<AutoresponderRow>> {
         let conn = self.conn.clone();
         let room_id = room_id.to_owned();
@@ -500,8 +506,8 @@ impl Database {
                         cr.media_mxc_uri, cr.media_filename, cr.media_mime_type
                  FROM autoresponders a
                  JOIN canned_responses cr ON a.response_id = cr.id
-                 WHERE a.room_id = ?1
-                 ORDER BY a.id",
+                 WHERE a.room_id = ?1 OR a.room_id = ''
+                 ORDER BY (a.room_id = '') ASC, a.id ASC",
                 )
                 .context("Failed to prepare autoresponders query")?;
             let rows = stmt
@@ -528,6 +534,49 @@ impl Database {
         })
         .await
         .context("get_autoresponders task panicked")?
+    }
+
+    /// Return autoresponders for an exact room_id only.
+    /// Pass `""` to list only global autoresponders.
+    pub async fn list_autoresponders(&self, room_id: &str) -> Result<Vec<AutoresponderRow>> {
+        let conn = self.conn.clone();
+        let room_id = room_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT a.pattern, a.probability, cr.id, cr.text_markdown, cr.media_cas_hash,
+                            cr.media_mxc_uri, cr.media_filename, cr.media_mime_type
+                    FROM autoresponders a
+                    JOIN canned_responses cr ON a.response_id = cr.id
+                    WHERE a.room_id = ?1
+                    ORDER BY a.id",
+                )
+                .context("Failed to prepare autoresponders list query")?;
+            let rows = stmt
+                .query_map([&room_id], |row| {
+                    Ok(AutoresponderRow {
+                        pattern: row.get(0)?,
+                        probability: row.get(1)?,
+                        response: CannedResponse {
+                            id: row.get(2)?,
+                            text_markdown: row.get(3)?,
+                            media_cas_hash: row.get(4)?,
+                            media_mxc_uri: row.get(5)?,
+                            media_filename: row.get(6)?,
+                            media_mime_type: row.get(7)?,
+                        },
+                    })
+                })
+                .context("Failed to list autoresponders")?;
+            let mut result = Vec::new();
+            for row in rows {
+                result.push(row.context("Failed to read autoresponder row")?);
+            }
+            Ok(result)
+        })
+        .await
+        .context("list_autoresponders task panicked")?
     }
 
     pub async fn update_media_mxc(&self, response_id: i64, mxc_uri: &str) -> Result<()> {
@@ -658,6 +707,104 @@ mod tests {
                 .is_none()
         );
         assert!(!db.remove_custom_command(room, "!links").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_global_custom_command_fallback() {
+        let db = Database::open_in_memory().await.unwrap();
+        let room = "!test:example.com";
+
+        // Create a global command (room_id = "").
+        let rid = db
+            .create_canned_response(Some("global links"), None, None, None)
+            .await
+            .unwrap();
+        db.add_custom_command("", "!links", rid).await.unwrap();
+
+        // Any room should see the global command.
+        let resp = db
+            .get_custom_command(room, "!links")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.text_markdown.as_deref(), Some("global links"));
+
+        // A room-specific override takes priority.
+        let rid2 = db
+            .create_canned_response(Some("room links"), None, None, None)
+            .await
+            .unwrap();
+        db.add_custom_command(room, "!links", rid2).await.unwrap();
+
+        let resp = db
+            .get_custom_command(room, "!links")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.text_markdown.as_deref(), Some("room links"));
+
+        // Other rooms still see the global one.
+        let resp = db
+            .get_custom_command("!other:example.com", "!links")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.text_markdown.as_deref(), Some("global links"));
+
+        // Removing the room-specific one restores global fallback.
+        assert!(db.remove_custom_command(room, "!links").await.unwrap());
+        let resp = db
+            .get_custom_command(room, "!links")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.text_markdown.as_deref(), Some("global links"));
+
+        // Removing the global one makes it gone everywhere.
+        assert!(db.remove_custom_command("", "!links").await.unwrap());
+        assert!(
+            db.get_custom_command(room, "!links")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_global_autoresponders_included() {
+        let db = Database::open_in_memory().await.unwrap();
+        let room = "!test:example.com";
+
+        // Global autoresponder.
+        let rid1 = db
+            .create_canned_response(Some("global hi"), None, None, None)
+            .await
+            .unwrap();
+        db.add_autoresponder("", "hello", 1.0, rid1).await.unwrap();
+
+        // Room-specific autoresponder.
+        let rid2 = db
+            .create_canned_response(Some("room bye"), None, None, None)
+            .await
+            .unwrap();
+        db.add_autoresponder(room, "bye", 1.0, rid2).await.unwrap();
+
+        let autos = db.get_autoresponders(room).await.unwrap();
+        assert_eq!(autos.len(), 2);
+        // Room-specific first.
+        assert_eq!(autos[0].pattern, "bye");
+        assert_eq!(autos[0].response.text_markdown.as_deref(), Some("room bye"));
+        // Global second.
+        assert_eq!(autos[1].pattern, "hello");
+        assert_eq!(
+            autos[1].response.text_markdown.as_deref(),
+            Some("global hi")
+        );
+
+        // A different room only sees the global one.
+        let autos2 = db.get_autoresponders("!other:example.com").await.unwrap();
+        assert_eq!(autos2.len(), 1);
+        assert_eq!(autos2[0].pattern, "hello");
     }
 
     #[tokio::test]
