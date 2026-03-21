@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
 
+const DEFAULT_COMMAND_PREFIX: &str = "!embedbot";
 const DEFAULT_HOMESERVER_URL: &str = "https://matrix.org";
 const DEFAULT_STATE_STORE_PATH: &str = "state";
 const DEFAULT_DATABASE_PATH: &str = "matrix-embed.db";
@@ -93,6 +94,10 @@ pub struct Args {
     #[arg(long)]
     pub display_name: Option<String>,
 
+    /// Command prefix the bot responds to (e.g. "!mybot")
+    #[arg(long, default_value = DEFAULT_COMMAND_PREFIX)]
+    pub command_prefix: String,
+
     /// Proxy to use when making external requests
     #[arg(long)]
     pub proxy: Option<Url>,
@@ -146,6 +151,7 @@ pub struct Config {
     pub max_embed_description_lines: usize,
     pub avatar_data: Option<Vec<u8>>,
     pub display_name: Option<String>,
+    pub command_prefix: String,
     pub proxy: Option<Url>,
     pub reset_identity: bool,
     pub recovery_passphrase: Option<String>,
@@ -251,6 +257,7 @@ impl Config {
             max_embed_description_lines: args.max_embed_description_lines,
             avatar_data,
             display_name: args.display_name,
+            command_prefix: args.command_prefix,
             proxy: args.proxy,
             reset_identity: args.reset_identity,
             recovery_passphrase,
@@ -297,6 +304,7 @@ impl Default for Config {
             max_embed_description_lines: DEFAULT_MAX_EMBED_DESCRIPTION_LINES,
             avatar_data: None,
             display_name: None,
+            command_prefix: DEFAULT_COMMAND_PREFIX.to_string(),
             proxy: None,
             reset_identity: false,
             recovery_passphrase: None,

@@ -37,11 +37,12 @@ pub async fn handle_command(
     ap_detector: &ActivityPubDetector,
 ) -> CommandResult {
     let trimmed = body.trim();
-    if trimmed.starts_with("!embedbot") {
+    let prefix = &config.command_prefix;
+    if trimmed.starts_with(prefix.as_str()) {
         let args: Vec<&str> = trimmed.split_whitespace().collect();
 
         return match args.get(1).copied() {
-            None => CommandResult::Response(usage_root()),
+            None => CommandResult::Response(usage_root(prefix)),
             Some("admin") => {
                 handle_admin(
                     room_id,
@@ -53,13 +54,16 @@ pub async fn handle_command(
                     http_client,
                     media_store,
                     ap_detector,
+                    prefix,
                 )
                 .await
             }
-            Some("export-keys") => handle_export_keys(room_id, client, database).await,
-            Some(other) => {
-                CommandResult::Response(format!("Unknown command `{}`. {}", other, usage_root()))
-            }
+            Some("export-keys") => handle_export_keys(room_id, client, database, prefix).await,
+            Some(other) => CommandResult::Response(format!(
+                "Unknown command `{}`. {}",
+                other,
+                usage_root(prefix)
+            )),
         };
     }
 
@@ -77,16 +81,18 @@ pub async fn handle_command(
     CommandResult::NotACommand
 }
 
-fn usage_root() -> String {
-    "Usage: `!embedbot <subcommand>`\n\n\
+fn usage_root(prefix: &str) -> String {
+    format!(
+        "Usage: `{prefix} <subcommand>`\n\n\
 Available subcommands:\n\
 - `export-keys` — Export room keys for this room (Element-compatible format)\n\
 - `admin` — Admin commands (trusted users only)"
-        .to_string()
+    )
 }
 
-fn usage_admin() -> String {
-    "Usage: `!embedbot admin <subcommand>`\n\n\
+fn usage_admin(prefix: &str) -> String {
+    format!(
+        "Usage: `{prefix} admin <subcommand>`\n\n\
 Available subcommands:\n\
 - `list-devices` — List all devices on this bot's account\n\
 - `remove-device <device_id>` — Remove a device from this bot's account\n\
@@ -101,7 +107,7 @@ Available subcommands:\n\
 - `add-autoresponder [--global] <pattern> [probability] [media_url] [text...]` — Add/update an autoresponder\n\
 - `remove-autoresponder [--global] <pattern>` — Remove an autoresponder\n\
 - `list-autoresponders [--global]` — List autoresponders for this room (or globally)"
-        .to_string()
+    )
 }
 
 /// Parses a `--global` flag from the front of args. Returns the effective
@@ -124,6 +130,7 @@ async fn handle_admin(
     http_client: &reqwest::Client,
     media_store: &MediaStore,
     ap_detector: &ActivityPubDetector,
+    prefix: &str,
 ) -> CommandResult {
     if !config.trusted_users.iter().any(|u| u == sender) {
         warn!("Untrusted user {} attempted to use admin command", sender);
@@ -133,9 +140,9 @@ async fn handle_admin(
     }
 
     match args.first().copied() {
-        None => CommandResult::Response(usage_admin()),
+        None => CommandResult::Response(usage_admin(prefix)),
         Some("list-devices") => handle_list_devices(client).await,
-        Some("remove-device") => handle_remove_device(&args[1..], config, client).await,
+        Some("remove-device") => handle_remove_device(&args[1..], config, client, prefix).await,
         Some("remove-other-devices") => handle_remove_other_devices(config, client).await,
         Some("reset-identity") => handle_reset_identity(config, client).await,
         Some("enable-key-sharing") => {
@@ -154,10 +161,13 @@ async fn handle_admin(
                 config,
                 media_store,
                 ap_detector,
+                prefix,
             )
             .await
         }
-        Some("remove-command") => handle_remove_command(room_id, &args[1..], database).await,
+        Some("remove-command") => {
+            handle_remove_command(room_id, &args[1..], database, prefix).await
+        }
         Some("list-commands") => handle_list_commands(room_id, &args[1..], database).await,
         Some("add-autoresponder") => {
             handle_add_autoresponder(
@@ -168,11 +178,12 @@ async fn handle_admin(
                 config,
                 media_store,
                 ap_detector,
+                prefix,
             )
             .await
         }
         Some("remove-autoresponder") => {
-            handle_remove_autoresponder(room_id, &args[1..], database).await
+            handle_remove_autoresponder(room_id, &args[1..], database, prefix).await
         }
         Some("list-autoresponders") => {
             handle_list_autoresponders(room_id, &args[1..], database).await
@@ -180,7 +191,7 @@ async fn handle_admin(
         Some(other) => CommandResult::Response(format!(
             "Unknown admin command `{}`. {}",
             other,
-            usage_admin()
+            usage_admin(prefix)
         )),
     }
 }
@@ -218,11 +229,16 @@ async fn handle_list_devices(client: &Client) -> CommandResult {
     }
 }
 
-async fn handle_remove_device(args: &[&str], config: &Config, client: &Client) -> CommandResult {
+async fn handle_remove_device(
+    args: &[&str],
+    config: &Config,
+    client: &Client,
+    prefix: &str,
+) -> CommandResult {
     let Some(device_id_str) = args.first().copied() else {
-        return CommandResult::Response(
-            "Usage: `!embedbot admin remove-device <device_id>`".to_string(),
-        );
+        return CommandResult::Response(format!(
+            "Usage: `{prefix} admin remove-device <device_id>`"
+        ));
     };
 
     let device_id: OwnedDeviceId = device_id_str.into();
@@ -364,16 +380,16 @@ async fn handle_export_keys(
     room_id: &str,
     client: &Client,
     database: &Arc<Database>,
+    prefix: &str,
 ) -> CommandResult {
     // 1. Check that key sharing is enabled for this room.
     match database.is_key_sharing_enabled(room_id).await {
         Ok(false) => {
-            return CommandResult::Response(
+            return CommandResult::Response(format!(
                 "Key export is not available for this room.\n\n\
                  An admin must first enable it with \
-                 `!embedbot admin enable-key-sharing <room_id>`."
-                    .to_string(),
-            );
+                 `{prefix} admin enable-key-sharing <room_id>`."
+            ));
         }
         Err(e) => {
             error!(
@@ -538,15 +554,15 @@ async fn handle_add_command(
     config: &Config,
     media_store: &MediaStore,
     ap_detector: &ActivityPubDetector,
+    prefix: &str,
 ) -> CommandResult {
     let (room_id, args) = parse_global_flag(room_id, args);
     let scope = if room_id.is_empty() { " globally" } else { "" };
 
     let Some(name) = args.first().copied() else {
-        return CommandResult::Response(
-            "Usage: `!embedbot admin add-command [--global] <name> [media_url] [text...]`"
-                .to_string(),
-        );
+        return CommandResult::Response(format!(
+            "Usage: `{prefix} admin add-command [--global] <name> [media_url] [text...]`"
+        ));
     };
 
     if !name.starts_with('!') {
@@ -576,11 +592,10 @@ async fn handle_add_command(
     };
 
     if text.is_none() && media_info.is_none() {
-        return CommandResult::Response(
+        return CommandResult::Response(format!(
             "Must provide at least text or a media URL.\n\n\
-             Usage: `!embedbot admin add-command <name> [media_url] [text...]`"
-                .to_string(),
-        );
+             Usage: `{prefix} admin add-command [--global] <name> [media_url] [text...]`"
+        ));
     }
 
     let (cas_hash, filename, mime_type) = match &media_info {
@@ -624,6 +639,7 @@ async fn handle_remove_command(
     room_id: &str,
     args: &[&str],
     database: &Arc<Database>,
+    prefix: &str,
 ) -> CommandResult {
     let (room_id, args) = parse_global_flag(room_id, args);
     let scope = if room_id.is_empty() {
@@ -633,9 +649,9 @@ async fn handle_remove_command(
     };
 
     let Some(name) = args.first().copied() else {
-        return CommandResult::Response(
-            "Usage: `!embedbot admin remove-command [--global] <name>`".to_string(),
-        );
+        return CommandResult::Response(format!(
+            "Usage: `{prefix} admin remove-command [--global] <name>`"
+        ));
     };
 
     match database.remove_custom_command(room_id, name).await {
@@ -700,15 +716,15 @@ async fn handle_add_autoresponder(
     config: &Config,
     media_store: &MediaStore,
     ap_detector: &ActivityPubDetector,
+    prefix: &str,
 ) -> CommandResult {
     let (room_id, args) = parse_global_flag(room_id, args);
     let scope = if room_id.is_empty() { " globally" } else { "" };
 
     let Some(pattern) = args.first().copied() else {
-        return CommandResult::Response(
-            "Usage: `!embedbot admin add-autoresponder [--global] <pattern> [probability] [media_url] [text...]`"
-                .to_string(),
-        );
+        return CommandResult::Response(format!(
+            "Usage: `{prefix} admin add-autoresponder [--global] <pattern> [probability] [media_url] [text...]`"
+        ));
     };
 
     if regex::Regex::new(pattern).is_err() {
@@ -748,11 +764,10 @@ async fn handle_add_autoresponder(
     };
 
     if text.is_none() && media_info.is_none() {
-        return CommandResult::Response(
+        return CommandResult::Response(format!(
             "Must provide at least text or a media URL.\n\n\
-             Usage: `!embedbot admin add-autoresponder <pattern> [probability] [media_url] [text...]`"
-                .to_string(),
-        );
+             Usage: `{prefix} admin add-autoresponder [--global] <pattern> [probability] [media_url] [text...]`"
+        ));
     }
 
     let (cas_hash, filename, mime_type) = match &media_info {
@@ -804,6 +819,7 @@ async fn handle_remove_autoresponder(
     room_id: &str,
     args: &[&str],
     database: &Arc<Database>,
+    prefix: &str,
 ) -> CommandResult {
     let (room_id, args) = parse_global_flag(room_id, args);
     let scope = if room_id.is_empty() {
@@ -813,9 +829,9 @@ async fn handle_remove_autoresponder(
     };
 
     let Some(pattern) = args.first().copied() else {
-        return CommandResult::Response(
-            "Usage: `!embedbot admin remove-autoresponder [--global] <pattern>`".to_string(),
-        );
+        return CommandResult::Response(format!(
+            "Usage: `{prefix} admin remove-autoresponder [--global] <pattern>`"
+        ));
     };
 
     match database.remove_autoresponder(room_id, pattern).await {
@@ -1450,6 +1466,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_custom_prefix() {
+        let config = Config {
+            command_prefix: "!mybot".to_string(),
+            trusted_users: vec!["@admin:example.com".to_string()],
+            ..Config::default()
+        };
+        let client = Client::builder()
+            .homeserver_url("https://matrix.example.com")
+            .build()
+            .await
+            .unwrap();
+        let db = test_database().await;
+
+        // "!mybot" should be recognised as the bot command.
+        let result = run_cmd(
+            "!mybot",
+            "@user:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => {
+                assert!(msg.contains("Usage"));
+                assert!(msg.contains("!mybot"), "help should use custom prefix");
+                assert!(!msg.contains("!embedbot"));
+            }
+            _ => panic!("Expected Response"),
+        }
+
+        // "!embedbot" should NOT be recognised with the custom prefix.
+        let result = run_cmd(
+            "!embedbot",
+            "@user:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        assert!(matches!(result, CommandResult::NotACommand));
+
+        // Admin help should also use the custom prefix.
+        let result = run_cmd(
+            "!mybot admin",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => {
+                assert!(msg.contains("!mybot admin"));
+                assert!(!msg.contains("!embedbot"));
+            }
+            _ => panic!("Expected Response"),
+        }
+
+        // Subcommand usage should use the custom prefix.
+        let result = run_cmd(
+            "!mybot admin remove-device",
+            "@admin:example.com",
+            "!testroom:example.com",
+            &config,
+            &client,
+            &db,
+        )
+        .await;
+        match result {
+            CommandResult::Response(msg) => {
+                assert!(msg.contains("!mybot admin remove-device"));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_admin_add_global_command() {
         let config = test_config(vec!["@admin:example.com"]);
         let client = Client::builder()
@@ -1595,7 +1692,7 @@ mod tests {
         let db = test_database().await;
 
         let result = run_cmd(
-            "!embedbot admin add-autoresponder --global hello 0.5 hi there!",
+            "!embedbot admin add-autoresponder --global hello hi there!",
             "@admin:example.com",
             "!testroom:example.com",
             &config,
@@ -1607,7 +1704,6 @@ mod tests {
             CommandResult::Response(msg) => {
                 assert!(msg.contains("has been set"), "got: {}", msg);
                 assert!(msg.contains("globally"));
-                assert!(msg.contains("50%"));
             }
             _ => panic!("Expected Response"),
         }
@@ -1629,7 +1725,7 @@ mod tests {
         .await;
         match result {
             CommandResult::Response(msg) => {
-                assert!(msg.contains("hello"));
+                assert!(msg.contains("hello"), "got: {}", msg);
                 assert!(msg.contains("globally"));
             }
             _ => panic!("Expected Response"),

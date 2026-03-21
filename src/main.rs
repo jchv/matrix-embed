@@ -582,7 +582,7 @@ async fn ensure_verified(client: &Client, config: &Config) {
 
     warn!(
         "Device is NOT verified. Encrypted rooms may not work correctly. \
-         Provide --recovery-passphrase-file or run `!embedbot admin reset-identity`."
+         Provide --recovery-passphrase-file or run `<command_prefix> admin reset-identity`."
     );
 }
 
