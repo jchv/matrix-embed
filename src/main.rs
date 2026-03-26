@@ -326,7 +326,7 @@ async fn restore_or_login(config: &Config, session_file: &Path) -> Result<Client
     } else if has_store_files(&config.state_store_path).await {
         // Store directory has data but no session.json – leftover from a crash
         // or manual deletion.
-        bail!("State store exists but session.json is missing!")
+        //bail!("State store exists but session.json is missing!")
     }
 
     // If we can't restore, then log in again.
