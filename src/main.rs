@@ -6,14 +6,10 @@ use matrix_sdk::{
     config::SyncSettings,
     encryption::VerificationState,
     room::Room,
-    ruma::{
-        OwnedDeviceId,
-        api::client::uiaa,
-        events::room::{
-            member::{MembershipState, StrippedRoomMemberEvent, SyncRoomMemberEvent},
-            message::OriginalSyncRoomMessageEvent,
-            redaction::SyncRoomRedactionEvent,
-        },
+    ruma::events::room::{
+        member::{MembershipState, StrippedRoomMemberEvent, SyncRoomMemberEvent},
+        message::OriginalSyncRoomMessageEvent,
+        redaction::SyncRoomRedactionEvent,
     },
     store::RoomLoadSettings,
 };
@@ -300,48 +296,52 @@ async fn main() -> Result<()> {
 ///
 /// 1. If a `session.json` exists, try to restore from it and validate the token
 ///    with a `whoami` call.
-/// 2. On failure (or if no file exists), fall back to a fresh password login,
-///    cleaning up the old store and device along the way.
+/// 2. Only if no session file exists (and we have credentials), try to do a fresh
+///    login.
+///
+/// The Matrix SDK doesn't seem like it can handle carrying state over to a new
+/// device ID, so this seems to be our best bet for now.
 async fn restore_or_login(config: &Config, session_file: &Path) -> Result<Client> {
-    let mut old_device_id: Option<String> = None;
-
     // Try to restore from session.json
-    if session_file.exists() {
-        match try_restore_session(config, session_file).await {
-            Ok(client) => return Ok(client),
-            Err(e) => {
-                warn!(
-                    "Failed to restore session: {:#}. Will attempt a fresh login.",
-                    e
-                );
-                // Remember the old device so we can clean it up later.
-                old_device_id = read_old_device_id(session_file).await;
-
-                // Delete the old session.json file, since it's now stale.
-                if let Err(e) = tokio::fs::remove_file(session_file).await {
-                    warn!("Failed to clean up old session file: {}", e);
-                }
-            }
-        }
-    } else if has_store_files(&config.state_store_path).await {
-        // Store directory has data but no session.json – leftover from a crash
-        // or manual deletion.
-        //bail!("State store exists but session.json is missing!")
-    }
-
-    // If we can't restore, then log in again.
-    if !config.username.is_empty() {
+    if session_file.exists() && !config.username.is_empty() {
         let client = login_fresh(config).await?;
         save_session_with_homeserver(config.homeserver_url.as_str(), &client, session_file).await?;
-
-        // Best-effort: remove the device that we could no longer restore.
-        if let Some(ref id) = old_device_id {
-            try_delete_device(&client, config, id).await;
-        }
         return Ok(client);
     }
 
-    bail!("No usable credentials! Failed to restore session and failed to log in.");
+    match try_restore_session(config, session_file).await {
+        Ok(client) => return Ok(client),
+        Err(e) => {
+            // If the failure is a transient network error (DNS, timeout,
+            // connection refused, …), don't throw away a potentially-valid
+            // session — propagate the error instead.
+            if is_network_error(&e) {
+                return Err(e.context(
+                    "Network error while validating session; \
+                        not discarding potentially-valid session",
+                ));
+            }
+
+            bail!(
+                "Failed to restore session: {:#}. Delete state files and try again.",
+                e
+            );
+        }
+    }
+}
+
+/// Returns `true` if the error chain contains a transient network-level error
+/// (DNS failure, connection refused, timeout, etc.) as opposed to an
+/// HTTP-level rejection like 401 Unauthorized.
+fn is_network_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(reqwest_err) = cause.downcast_ref::<reqwest::Error>() {
+            if reqwest_err.is_connect() || reqwest_err.is_timeout() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Attempt to restore from `session.json`, then validate the token with a
@@ -504,20 +504,6 @@ async fn write_session_file(session_file: &Path, saved: &SavedSession) -> Result
     Ok(())
 }
 
-/// Best-effort read of the `device_id` from an existing session file.
-async fn read_old_device_id(session_file: &Path) -> Option<String> {
-    let content = tokio::fs::read_to_string(session_file).await.ok()?;
-    let saved: SavedSession = serde_json::from_str(&content).ok()?;
-    Some(saved.device_id)
-}
-
-async fn has_store_files(state_store_path: &Path) -> bool {
-    let Ok(mut entries) = tokio::fs::read_dir(state_store_path).await else {
-        return false;
-    };
-    entries.next_entry().await.ok().flatten().is_some()
-}
-
 // ===========================================================================
 // Verification / recovery
 // ===========================================================================
@@ -625,55 +611,4 @@ fn spawn_session_change_listener(client: &Client, session_file: std::path::PathB
             }
         }
     });
-}
-
-// ===========================================================================
-// Device helpers (used internally for old-device cleanup)
-// ===========================================================================
-
-/// Best-effort attempt to delete a single device from the account, handling
-/// the UIAA password-auth flow if the server requires it.
-pub(crate) async fn try_delete_device(client: &Client, config: &Config, device_id_str: &str) {
-    // Never delete the device we are currently using.
-    if let Some(current) = client.device_id() {
-        if current.as_str() == device_id_str {
-            return;
-        }
-    }
-
-    let device_id: OwnedDeviceId = device_id_str.into();
-    info!("Attempting to remove old device {}...", device_id);
-
-    let devices = [device_id.clone()];
-    match client.delete_devices(&devices, None).await {
-        Ok(_) => {
-            info!("Removed device {}", device_id);
-        }
-        Err(e) => {
-            if let Some(uiaa_info) = e.as_uiaa_response() {
-                let Some(password) = config.password.as_deref() else {
-                    warn!(
-                        "Server requires auth to delete device {} but no password is configured.",
-                        device_id
-                    );
-                    return;
-                };
-                let mut auth = uiaa::Password::new(
-                    uiaa::UserIdentifier::UserIdOrLocalpart(config.username.clone()),
-                    password.to_owned(),
-                );
-                auth.session = uiaa_info.session.clone();
-
-                match client
-                    .delete_devices(&devices, Some(uiaa::AuthData::Password(auth)))
-                    .await
-                {
-                    Ok(_) => info!("Removed device {} (with password auth)", device_id),
-                    Err(e) => warn!("Failed to remove device {} with auth: {}", device_id, e),
-                }
-            } else {
-                warn!("Failed to remove device {}: {}", device_id, e);
-            }
-        }
-    }
 }

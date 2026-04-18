@@ -578,22 +578,6 @@ impl Database {
         .await
         .context("list_autoresponders task panicked")?
     }
-
-    pub async fn update_media_mxc(&self, response_id: i64, mxc_uri: &str) -> Result<()> {
-        let conn = self.conn.clone();
-        let mxc_uri = mxc_uri.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.blocking_lock();
-            conn.execute(
-                "UPDATE canned_responses SET media_mxc_uri = ?1 WHERE id = ?2",
-                rusqlite::params![mxc_uri, response_id],
-            )
-            .context("Failed to update media mxc URI")?;
-            Ok(())
-        })
-        .await
-        .context("update_media_mxc task panicked")?
-    }
 }
 
 #[cfg(test)]
