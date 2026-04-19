@@ -303,7 +303,7 @@ async fn main() -> Result<()> {
 /// device ID, so this seems to be our best bet for now.
 async fn restore_or_login(config: &Config, session_file: &Path) -> Result<Client> {
     // Try to restore from session.json
-    if session_file.exists() && !config.username.is_empty() {
+    if !session_file.exists() && !config.username.is_empty() {
         let client = login_fresh(config).await?;
         save_session_with_homeserver(config.homeserver_url.as_str(), &client, session_file).await?;
         return Ok(client);
