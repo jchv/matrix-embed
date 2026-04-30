@@ -123,6 +123,7 @@ pub async fn handle_message(
             let reply = Reply {
                 event_id: event.event_id.clone(),
                 enforce_thread: EnforceThread::MaybeThreaded,
+                add_mentions: AddMentions::No,
             };
             let attach_config = AttachmentConfig::new()
                 .caption(Some(caption))
@@ -395,6 +396,7 @@ async fn post_message(
         let reply = Reply {
             event_id: reply_target.event_id().to_owned(),
             enforce_thread: EnforceThread::MaybeThreaded,
+            add_mentions: AddMentions::No,
         };
 
         let result = with_typing(
@@ -419,14 +421,14 @@ async fn post_message(
                 if has_text {
                     let content = make_text_reply(params.body, params.html_body, reply_target);
                     let response = room.send(content).await?;
-                    return Ok(Some(response.event_id));
+                    return Ok(Some(response.response.event_id));
                 }
             }
         }
     } else if has_text {
         let content = make_text_reply(params.body, params.html_body, reply_target);
         let response = room.send(content).await?;
-        return Ok(Some(response.event_id));
+        return Ok(Some(response.response.event_id));
     }
 
     Ok(None)
@@ -445,9 +447,9 @@ fn make_text_reply(
             .make_reply_to(event.as_ref(), ForwardThread::Yes, AddMentions::No),
         ReplyTarget::EventId(id) => {
             let mut content = RoomMessageEventContent::text_html(body, html_body);
-            content.relates_to = Some(Relation::Reply {
-                in_reply_to: InReplyTo::new(id.clone()),
-            });
+            content.relates_to = Some(Relation::Reply(
+                matrix_sdk::ruma::events::relation::Reply::new(InReplyTo::new(id.clone())),
+            ));
             content
         }
     }
@@ -495,6 +497,7 @@ async fn send_canned_response(
     let reply = Reply {
         event_id: event_id.to_owned(),
         enforce_thread: EnforceThread::MaybeThreaded,
+        add_mentions: AddMentions::No,
     };
 
     if let Some(cas_hash) = &canned.media_cas_hash {
@@ -518,9 +521,9 @@ async fn send_canned_response(
             .await?;
     } else if let Some(text) = &canned.text_markdown {
         let mut content = RoomMessageEventContent::text_markdown(text);
-        content.relates_to = Some(Relation::Reply {
-            in_reply_to: InReplyTo::new(event_id.to_owned()),
-        });
+        content.relates_to = Some(Relation::Reply(
+            matrix_sdk::ruma::events::relation::Reply::new(InReplyTo::new(event_id.to_owned())),
+        ));
         room.send(content).await?;
     }
 

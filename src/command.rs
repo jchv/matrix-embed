@@ -348,7 +348,9 @@ async fn reset_identity(client: &Client, config: &Config) -> Result<String> {
                     .context("Server requires interactive auth to reset cross-signing keys, but no password is configured")?;
 
                 let mut auth = uiaa::Password::new(
-                    uiaa::UserIdentifier::UserIdOrLocalpart(config.username.clone()),
+                    uiaa::UserIdentifier::Matrix(uiaa::MatrixUserIdentifier::new(
+                        config.username.clone(),
+                    )),
                     password.to_owned(),
                 );
                 auth.session = uiaa_info.session.clone();
@@ -956,7 +958,9 @@ pub(crate) async fn remove_device(
                     .context("Server requires interactive auth to delete devices, but no password is configured")?;
 
                 let mut auth = uiaa::Password::new(
-                    uiaa::UserIdentifier::UserIdOrLocalpart(config.username.clone()),
+                    uiaa::UserIdentifier::Matrix(uiaa::MatrixUserIdentifier::new(
+                        config.username.clone(),
+                    )),
                     password.to_owned(),
                 );
                 auth.session = info.session.clone();

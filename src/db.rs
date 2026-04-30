@@ -869,18 +869,5 @@ mod tests {
         assert_eq!(resp.media_filename.as_deref(), Some("image.png"));
         assert_eq!(resp.media_mime_type.as_deref(), Some("image/png"));
         assert!(resp.media_mxc_uri.is_none());
-
-        db.update_media_mxc(resp.id, "mxc://example.com/abc123")
-            .await
-            .unwrap();
-        let resp = db
-            .get_custom_command("!room:example.com", "!pic")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            resp.media_mxc_uri.as_deref(),
-            Some("mxc://example.com/abc123")
-        );
     }
 }

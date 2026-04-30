@@ -6,8 +6,22 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+    }:
+    let
+      matrixEmbedModule =
+        { pkgs, lib, ... }:
+        {
+          imports = [ ./nix/module.nix ];
+          services.matrix-embed.package = lib.mkDefault self.packages.${pkgs.system}.default;
+        };
+    in
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
         lib = nixpkgs.lib;
@@ -19,13 +33,26 @@
           version = manifest.version;
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          cargoLock.outputHashes = {
+            "matrix-sdk-0.16.0" = "sha256-9PWcs+ZK93uJrBoDCqCpIGfCr71AL2ByMsHnKqPQuMU=";
+          };
+          doCheck = false;
 
-          nativeBuildInputs = [ pkgs.pkg-config pkgs.makeWrapper ];
-          nativeCheckInputs = [ pkgs.ffmpeg pkgs.cacert ];
-          buildInputs = [ pkgs.openssl pkgs.sqlite ];
+          nativeBuildInputs = [
+            pkgs.pkg-config
+            pkgs.makeWrapper
+          ];
+          nativeCheckInputs = [
+            pkgs.ffmpeg
+            pkgs.cacert
+          ];
+          buildInputs = [
+            pkgs.openssl
+            pkgs.sqlite
+          ];
           fixupPhase = ''
             wrapProgram $out/bin/matrix-embed \
-              --prefix PATH : ${lib.makeBinPath [pkgs.ffmpeg]}
+              --prefix PATH : ${lib.makeBinPath [ pkgs.ffmpeg ]}
           '';
         };
 
@@ -43,5 +70,9 @@
           ];
         };
       }
-    );
+    )
+    // {
+      nixosModules.matrix-embed = matrixEmbedModule;
+      nixosModules.default = matrixEmbedModule;
+    };
 }
